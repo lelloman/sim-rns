@@ -208,83 +208,138 @@ fn install_launcher_css() {
     provider.load_from_data(
         "
         .sim-rns-launcher {
-            padding: 12px;
+            padding: 0;
         }
         .sim-rns-launcher-header {
-            margin-bottom: 4px;
+            margin-bottom: 0;
         }
         .sim-rns-launcher-title {
-            font-size: 30px;
+            font-size: 20px;
             font-weight: 700;
-            letter-spacing: -0.03em;
+            letter-spacing: -0.01em;
         }
-        .sim-rns-launcher-subtitle {
-            font-size: 13px;
-            opacity: 0.66;
+
+        /* --- Recents column (left sidebar feel) --- */
+        .sim-rns-recents-column {
+            background: alpha(black, 0.03);
+            padding: 20px 16px;
         }
-        .sim-rns-welcome-panel,
         .sim-rns-recents-panel {
             border-radius: 0;
             background: transparent;
             box-shadow: none;
             border: none;
         }
-        .sim-rns-welcome-panel {
-            min-width: 260px;
-            background: alpha(black, 0.035);
-            border-radius: 12px;
-        }
-        .sim-rns-mark {
-            font-size: 11px;
-            font-weight: 700;
-            letter-spacing: 0.16em;
-            opacity: 0.58;
-        }
-        .sim-rns-welcome-title {
-            font-size: 16px;
-            font-weight: 650;
-        }
-        .sim-rns-welcome-copy {
-            font-size: 13px;
-            line-height: 1.3;
-            opacity: 0.74;
-        }
-        .sim-rns-primary-action {
-            min-height: 36px;
-            font-weight: 650;
-        }
-        .sim-rns-secondary-note {
-            font-size: 12px;
-            opacity: 0.6;
-        }
         .sim-rns-recents-title {
-            font-size: 22px;
+            font-size: 13px;
             font-weight: 700;
-            letter-spacing: -0.01em;
+            letter-spacing: 0.04em;
+            opacity: 0.55;
+            text-transform: uppercase;
+        }
+        .sim-rns-recents-list {
+            background: transparent;
         }
         .sim-rns-recents-list row {
             margin: 0;
-            border-radius: 0;
+            padding: 0;
+            border-radius: 8px;
             background: transparent;
-            border-bottom: 1px solid alpha(currentColor, 0.08);
+            transition: background 150ms ease;
         }
-        .sim-rns-recents-list row:last-child {
-            border-bottom: none;
+        .sim-rns-recents-list row:hover {
+            background: alpha(currentColor, 0.06);
+        }
+        .sim-rns-recent-row {
+            padding: 10px 12px;
+        }
+        .sim-rns-recent-info {
+            min-width: 0;
         }
         .sim-rns-recent-title {
-            font-size: 15px;
-            font-weight: 650;
+            font-size: 14px;
+            font-weight: 600;
         }
         .sim-rns-recent-path {
-            font-size: 12px;
-            opacity: 0.62;
+            font-size: 11px;
+            opacity: 0.50;
+            font-family: monospace;
         }
+        .sim-rns-recent-open-btn {
+            opacity: 0;
+            transition: opacity 150ms ease;
+            min-height: 28px;
+            min-width: 56px;
+            font-size: 12px;
+        }
+        .sim-rns-recents-list row:hover .sim-rns-recent-open-btn {
+            opacity: 1;
+        }
+
+        /* --- Right column: branding + actions --- */
+        .sim-rns-actions-column {
+            padding: 24px 28px;
+            background: #3c3f41;
+        }
+        .sim-rns-branding {
+            padding: 16px;
+        }
+        .sim-rns-brand-title {
+            font-size: 32px;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            color: #bbbbbb;
+        }
+        .sim-rns-brand-version {
+            font-size: 13px;
+            font-weight: 500;
+            color: #787878;
+            letter-spacing: 0.04em;
+        }
+        .sim-rns-actions-box {
+            padding: 16px;
+        }
+        .sim-rns-action-btn {
+            min-height: 40px;
+            min-width: 240px;
+            font-weight: 600;
+            font-size: 14px;
+            border-radius: 8px;
+            background: #45494a;
+            color: #bbbbbb;
+            border: 1px solid #515151;
+        }
+        .sim-rns-action-btn:hover {
+            background: #515658;
+        }
+        .sim-rns-action-btn.suggested-action {
+            background: #2d5c88;
+            color: #ffffff;
+            border: 1px solid #4b6eaf;
+        }
+        .sim-rns-action-btn.suggested-action:hover {
+            background: #365f8a;
+        }
+        .sim-rns-action-btn:disabled {
+            background: #3c3f41;
+            color: #606366;
+            border: 1px solid #45494a;
+        }
+
+        /* --- Divider between columns --- */
+        .sim-rns-column-divider {
+            background: alpha(currentColor, 0.10);
+            min-width: 1px;
+        }
+
         .sim-rns-error {
-            padding: 8px 10px;
+            margin: 8px 16px 0 16px;
+            padding: 8px 12px;
             border-radius: 6px;
             background: alpha(@error_color, 0.10);
             color: @error_color;
             font-weight: 600;
+            font-size: 13px;
         }
         ",
     );
@@ -312,11 +367,6 @@ fn build_panel_frame() -> (Frame, GtkBox) {
     (frame, content)
 }
 
-fn build_welcome_panel() -> (Frame, GtkBox) {
-    let (frame, content) = build_panel_frame();
-    content.set_spacing(14);
-    (frame, content)
-}
 
 fn open_selected_project(
     host: &maruzzella_sdk::ffi::MzHostApi,
@@ -344,24 +394,29 @@ fn append_recent_row(
     error_label: &Label,
 ) {
     let row = ListBoxRow::new();
-    let card = GtkBox::new(Orientation::Vertical, 8);
-    card.set_margin_top(8);
-    card.set_margin_bottom(8);
-    card.set_margin_start(6);
-    card.set_margin_end(6);
+    let hbox = GtkBox::new(Orientation::Horizontal, 12);
+    hbox.add_css_class("sim-rns-recent-row");
+
+    let info = GtkBox::new(Orientation::Vertical, 2);
+    info.set_hexpand(true);
+    info.add_css_class("sim-rns-recent-info");
 
     let title = Label::new(Some(&project.display_name));
     title.set_xalign(0.0);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     title.add_css_class("sim-rns-recent-title");
 
     let path = Label::new(Some(&project.path));
     path.set_xalign(0.0);
-    path.set_wrap(true);
-    path.set_selectable(true);
+    path.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
     path.add_css_class("sim-rns-recent-path");
 
+    info.append(&title);
+    info.append(&path);
+
     let button = Button::with_label("Open");
-    button.set_halign(Align::Start);
+    button.set_valign(Align::Center);
+    button.add_css_class("sim-rns-recent-open-btn");
 
     let host_copy = host;
     let project_copy = project.clone();
@@ -376,10 +431,9 @@ fn append_recent_row(
         }
     });
 
-    card.append(&title);
-    card.append(&path);
-    card.append(&button);
-    row.set_child(Some(&card));
+    hbox.append(&info);
+    hbox.append(&button);
+    row.set_child(Some(&hbox));
     list.append(&row);
 }
 
@@ -421,21 +475,8 @@ extern "C" fn create_launcher_view(
     }
     install_launcher_css();
 
-    let root = GtkBox::new(Orientation::Vertical, 18);
-    root.set_margin_top(24);
-    root.set_margin_bottom(24);
-    root.set_margin_start(24);
-    root.set_margin_end(24);
+    let root = GtkBox::new(Orientation::Vertical, 0);
     root.add_css_class("sim-rns-launcher");
-
-    let header = GtkBox::new(Orientation::Vertical, 6);
-    header.add_css_class("sim-rns-launcher-header");
-    let title = Label::new(Some("Open a project"));
-    title.set_xalign(0.0);
-    title.set_wrap(true);
-    title.add_css_class("sim-rns-launcher-title");
-    header.append(&title);
-    root.append(&header);
 
     let error_label = Label::new(None);
     error_label.set_xalign(0.0);
@@ -444,19 +485,22 @@ extern "C" fn create_launcher_view(
     error_label.set_visible(false);
     root.append(&error_label);
 
-    let body = GtkBox::new(Orientation::Horizontal, 18);
+    let body = GtkBox::new(Orientation::Horizontal, 0);
     body.set_hexpand(true);
     body.set_vexpand(true);
     root.append(&body);
 
+    // --- Left column: Recent Projects ---
     let recents_column = GtkBox::new(Orientation::Vertical, 12);
-    recents_column.set_hexpand(true);
+    recents_column.set_size_request(320, -1);
     recents_column.set_vexpand(true);
+    recents_column.add_css_class("sim-rns-recents-column");
     body.append(&recents_column);
 
-    let recents_header = GtkBox::new(Orientation::Vertical, 4);
+    let recents_header = GtkBox::new(Orientation::Horizontal, 8);
     let recents_title = Label::new(Some("Recent Projects"));
     recents_title.set_xalign(0.0);
+    recents_title.set_hexpand(true);
     recents_title.add_css_class("sim-rns-recents-title");
     recents_header.append(&recents_title);
     recents_column.append(&recents_header);
@@ -469,65 +513,69 @@ extern "C" fn create_launcher_view(
     let (recents_frame, recents_panel) = build_panel_frame();
     recents_frame.add_css_class("sim-rns-recents-panel");
     recents_panel.set_spacing(0);
+    recents_panel.set_margin_top(0);
+    recents_panel.set_margin_bottom(0);
+    recents_panel.set_margin_start(0);
+    recents_panel.set_margin_end(0);
     let recents_scroller = create_scroller();
-    recents_scroller.set_min_content_height(320);
+    recents_scroller.set_vexpand(true);
     recents_scroller.set_child(Some(&recent_projects));
     recents_panel.append(&recents_scroller);
     recents_column.append(&recents_frame);
 
-    let actions_column = GtkBox::new(Orientation::Vertical, 12);
-    actions_column.set_size_request(240, -1);
+    // --- Vertical divider ---
+    let divider = Separator::new(Orientation::Vertical);
+    divider.add_css_class("sim-rns-column-divider");
+    body.append(&divider);
+
+    // --- Right column: Branding (top) + Actions (bottom) ---
+    let actions_column = GtkBox::new(Orientation::Vertical, 0);
+    actions_column.set_size_request(480, -1);
+    actions_column.set_hexpand(true);
     actions_column.set_vexpand(true);
+    actions_column.add_css_class("sim-rns-actions-column");
     body.append(&actions_column);
 
-    let (welcome_frame, welcome_panel) = build_welcome_panel();
-    welcome_frame.add_css_class("sim-rns-welcome-panel");
-    actions_column.append(&welcome_frame);
+    // Top half: branding, centered
+    let branding = GtkBox::new(Orientation::Vertical, 8);
+    branding.set_vexpand(true);
+    branding.set_valign(Align::Center);
+    branding.set_halign(Align::Center);
+    branding.add_css_class("sim-rns-branding");
 
-    let product_mark = Label::new(Some("SIM RNS"));
-    product_mark.set_xalign(0.0);
-    product_mark.add_css_class("sim-rns-mark");
+    let product_title = Label::new(Some("SIM RNS"));
+    product_title.add_css_class("sim-rns-brand-title");
 
-    let welcome_title = Label::new(Some("Welcome"));
-    welcome_title.set_xalign(0.0);
-    welcome_title.add_css_class("sim-rns-welcome-title");
+    let version_label = Label::new(Some("v0.1.0"));
+    version_label.add_css_class("sim-rns-brand-version");
 
-    let welcome_copy = Label::new(Some(
-        "Choose a local directory to open the current simulator scaffold.",
-    ));
-    welcome_copy.set_xalign(0.0);
-    welcome_copy.set_wrap(true);
-    welcome_copy.add_css_class("sim-rns-welcome-copy");
+    branding.append(&product_title);
+    branding.append(&version_label);
+    actions_column.append(&branding);
+
+    // Bottom half: action buttons, centered
+    let actions_box = GtkBox::new(Orientation::Vertical, 10);
+    actions_box.set_vexpand(true);
+    actions_box.set_valign(Align::Center);
+    actions_box.set_halign(Align::Center);
+    actions_box.add_css_class("sim-rns-actions-box");
 
     let open_local = Button::with_label("Open Local Project");
-    open_local.set_halign(Align::Start);
     open_local.add_css_class("suggested-action");
-    open_local.add_css_class("sim-rns-primary-action");
+    open_local.add_css_class("sim-rns-action-btn");
 
-    let secondary_actions = GtkBox::new(Orientation::Vertical, 8);
     let open_remote = Button::with_label("Open Remote Project");
-    open_remote.set_halign(Align::Start);
+    open_remote.add_css_class("sim-rns-action-btn");
     open_remote.set_sensitive(false);
 
-    let create_project = Button::with_label("Create Project");
-    create_project.set_halign(Align::Start);
+    let create_project = Button::with_label("Create New Project");
+    create_project.add_css_class("sim-rns-action-btn");
     create_project.set_sensitive(false);
 
-    let staged_note = Label::new(Some("Remote attach and creation are staged next."));
-    staged_note.set_xalign(0.0);
-    staged_note.set_wrap(true);
-    staged_note.add_css_class("sim-rns-secondary-note");
-
-    secondary_actions.append(&open_remote);
-    secondary_actions.append(&create_project);
-
-    welcome_panel.append(&product_mark);
-    welcome_panel.append(&welcome_title);
-    welcome_panel.append(&welcome_copy);
-    welcome_panel.append(&open_local);
-    welcome_panel.append(&Separator::new(Orientation::Horizontal));
-    welcome_panel.append(&secondary_actions);
-    welcome_panel.append(&staged_note);
+    actions_box.append(&open_local);
+    actions_box.append(&open_remote);
+    actions_box.append(&create_project);
+    actions_column.append(&actions_box);
 
     let host_copy = *host_ref;
     let recent_projects_copy = recent_projects.clone();
