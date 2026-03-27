@@ -1,0 +1,3 @@
+[workspace]
+members = ["sim-rns-app", "sim-rns-core", "sim-rns-plugin"]
+resolver = "2"

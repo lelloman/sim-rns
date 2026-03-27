@@ -1,0 +1,8 @@
+[package]
+name = "sim-rns-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+maruzzella = { path = "../../maruzzella" }
+sim-rns-plugin = { path = "../sim-rns-plugin" }
