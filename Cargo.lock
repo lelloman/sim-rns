@@ -601,7 +601,9 @@ dependencies = [
 name = "sim-rns-app"
 version = "0.1.0"
 dependencies = [
+ "gtk4",
  "maruzzella",
+ "sim-rns-core",
  "sim-rns-plugin",
 ]
 
@@ -610,6 +612,7 @@ name = "sim-rns-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]

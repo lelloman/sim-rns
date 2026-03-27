@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -128,6 +130,98 @@ pub struct Attachment {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct StartupPlan {
     pub order: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectTransport {
+    Local,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectHandle {
+    pub transport: ProjectTransport,
+    pub path: String,
+    pub display_name: String,
+}
+
+impl ProjectHandle {
+    pub fn for_local_dir(path: impl AsRef<Path>) -> Result<Self, String> {
+        let normalized = normalize_local_project_path(path.as_ref())?;
+        let display_name = normalized
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| normalized.as_os_str().to_str().unwrap_or("project"))
+            .to_string();
+        Ok(Self {
+            transport: ProjectTransport::Local,
+            path: normalized.to_string_lossy().into_owned(),
+            display_name,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|error| format!("failed to serialize project handle: {error}"))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(bytes)
+            .map_err(|error| format!("failed to deserialize project handle: {error}"))
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LauncherConfig {
+    #[serde(default)]
+    pub recent_projects: Vec<ProjectHandle>,
+}
+
+impl LauncherConfig {
+    pub fn remember_project(&mut self, handle: ProjectHandle) {
+        self.recent_projects
+            .retain(|existing| existing.path != handle.path || existing.transport != handle.transport);
+        self.recent_projects.insert(0, handle);
+        if self.recent_projects.len() > 10 {
+            self.recent_projects.truncate(10);
+        }
+    }
+}
+
+type ProjectOpenCallback = dyn Fn(ProjectHandle) -> Result<(), String> + 'static;
+
+thread_local! {
+    static PROJECT_OPENER: RefCell<Option<Box<ProjectOpenCallback>>> = RefCell::new(None);
+}
+
+pub fn install_project_opener<F>(opener: F)
+where
+    F: Fn(ProjectHandle) -> Result<(), String> + 'static,
+{
+    PROJECT_OPENER.with(|callback| {
+        callback.replace(Some(Box::new(opener)));
+    });
+}
+
+pub fn open_project(handle: ProjectHandle) -> Result<(), String> {
+    PROJECT_OPENER.with(|callback| {
+        let callback = callback.borrow();
+        let opener = callback
+            .as_ref()
+            .ok_or_else(|| "project opener is not installed".to_string())?;
+        opener(handle)
+    })
+}
+
+pub fn normalize_local_project_path(path: &Path) -> Result<PathBuf, String> {
+    if !path.exists() {
+        return Err(format!("{} does not exist", path.display()));
+    }
+    if !path.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    std::fs::canonicalize(path)
+        .map_err(|error| format!("failed to resolve {}: {error}", path.display()))
 }
 
 pub fn base_templates() -> Vec<Template> {
@@ -398,5 +492,69 @@ pub fn sample_recipe() -> Recipe {
                 "phone-a".to_string(),
             ],
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_local_project_path, LauncherConfig, ProjectHandle, ProjectTransport};
+
+    #[test]
+    fn project_handle_round_trips_through_bytes() {
+        let handle = ProjectHandle {
+            transport: ProjectTransport::Local,
+            path: "/tmp/mesh-lab".to_string(),
+            display_name: "mesh-lab".to_string(),
+        };
+
+        let encoded = handle.to_bytes().expect("project handle should serialize");
+        let decoded = ProjectHandle::from_bytes(&encoded).expect("project handle should deserialize");
+
+        assert_eq!(decoded, handle);
+    }
+
+    #[test]
+    fn recent_projects_are_deduplicated_and_trimmed() {
+        let mut config = LauncherConfig::default();
+
+        for index in 0..12 {
+            config.remember_project(ProjectHandle {
+                transport: ProjectTransport::Local,
+                path: format!("/tmp/project-{index}"),
+                display_name: format!("project-{index}"),
+            });
+        }
+
+        config.remember_project(ProjectHandle {
+            transport: ProjectTransport::Local,
+            path: "/tmp/project-5".to_string(),
+            display_name: "project-5".to_string(),
+        });
+
+        assert_eq!(config.recent_projects.len(), 10);
+        assert_eq!(config.recent_projects[0].path, "/tmp/project-5");
+        assert_eq!(config.recent_projects[1].path, "/tmp/project-11");
+        assert!(!config
+            .recent_projects
+            .iter()
+            .any(|project| project.path == "/tmp/project-0"));
+    }
+
+    #[test]
+    fn local_project_path_validation_requires_existing_directory() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sim-rns-core-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+
+        let normalized =
+            normalize_local_project_path(&temp_dir).expect("directory should validate");
+        assert!(normalized.is_absolute());
+
+        let missing = temp_dir.join("missing");
+        assert!(normalize_local_project_path(&missing).is_err());
+
+        std::fs::remove_dir_all(&temp_dir).expect("temp dir should be removed");
     }
 }
