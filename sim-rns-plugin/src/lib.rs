@@ -1,9 +1,9 @@
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
-    gio, Align, Box as GtkBox, Button, CssProvider, Frame, Label, ListBox, ListBoxRow,
-    Orientation, PolicyType, ScrolledWindow, SelectionMode, Separator,
-    STYLE_PROVIDER_PRIORITY_APPLICATION,
+    gio, gdk, Align, Box as GtkBox, Button, CssProvider, Frame, Label, ListBox, ListBoxRow,
+    Orientation, Picture, PolicyType, ScrolledWindow, SelectionMode, Separator,
+    STYLE_PROVIDER_PRIORITY_USER,
 };
 use maruzzella_sdk::{
     export_plugin, HostApi, MzStatusCode, MzViewPlacement, Plugin, PluginDependency,
@@ -219,9 +219,8 @@ fn install_launcher_css() {
             letter-spacing: -0.01em;
         }
 
-        /* --- Recents column (left sidebar feel) --- */
+        /* --- Recents column (left sidebar) --- */
         .sim-rns-recents-column {
-            background: alpha(black, 0.03);
             padding: 20px 16px;
         }
         .sim-rns-recents-panel {
@@ -279,21 +278,19 @@ fn install_launcher_css() {
         /* --- Right column: branding + actions --- */
         .sim-rns-actions-column {
             padding: 24px 28px;
-            background: #3c3f41;
         }
         .sim-rns-branding {
             padding: 16px;
         }
         .sim-rns-brand-title {
-            font-size: 32px;
+            font-size: 28px;
             font-weight: 800;
             letter-spacing: 0.08em;
-            color: #bbbbbb;
         }
         .sim-rns-brand-version {
             font-size: 13px;
             font-weight: 500;
-            color: #787878;
+            opacity: 0.5;
             letter-spacing: 0.04em;
         }
         .sim-rns-actions-box {
@@ -305,25 +302,6 @@ fn install_launcher_css() {
             font-weight: 600;
             font-size: 14px;
             border-radius: 8px;
-            background: #45494a;
-            color: #bbbbbb;
-            border: 1px solid #515151;
-        }
-        .sim-rns-action-btn:hover {
-            background: #515658;
-        }
-        .sim-rns-action-btn.suggested-action {
-            background: #2d5c88;
-            color: #ffffff;
-            border: 1px solid #4b6eaf;
-        }
-        .sim-rns-action-btn.suggested-action:hover {
-            background: #365f8a;
-        }
-        .sim-rns-action-btn:disabled {
-            background: #3c3f41;
-            color: #606366;
-            border: 1px solid #45494a;
         }
 
         /* --- Divider between columns --- */
@@ -347,7 +325,7 @@ fn install_launcher_css() {
         gtk::style_context_add_provider_for_display(
             &display,
             &provider,
-            STYLE_PROVIDER_PRIORITY_APPLICATION,
+            STYLE_PROVIDER_PRIORITY_USER + 1,
         );
     }
 }
@@ -537,11 +515,25 @@ extern "C" fn create_launcher_view(
     body.append(&actions_column);
 
     // Top half: branding, centered
-    let branding = GtkBox::new(Orientation::Vertical, 8);
+    let branding = GtkBox::new(Orientation::Vertical, 12);
     branding.set_vexpand(true);
     branding.set_valign(Align::Center);
     branding.set_halign(Align::Center);
     branding.add_css_class("sim-rns-branding");
+
+    let icon_bytes = gtk::glib::Bytes::from_static(include_bytes!("../../sim-rns-icon.svg"));
+    let icon_texture = gdk::Texture::from_bytes(&icon_bytes).expect("failed to load app icon");
+    let icon_picture = Picture::for_paintable(&icon_texture);
+    icon_picture.set_can_shrink(true);
+    icon_picture.set_halign(Align::Center);
+    icon_picture.set_valign(Align::Center);
+    let icon_container = GtkBox::new(Orientation::Vertical, 0);
+    icon_container.set_size_request(96, 96);
+    icon_container.set_halign(Align::Center);
+    icon_container.set_valign(Align::Center);
+    icon_container.set_hexpand(false);
+    icon_container.set_vexpand(false);
+    icon_container.append(&icon_picture);
 
     let product_title = Label::new(Some("SIM RNS"));
     product_title.add_css_class("sim-rns-brand-title");
@@ -549,6 +541,7 @@ extern "C" fn create_launcher_view(
     let version_label = Label::new(Some("v0.1.0"));
     version_label.add_css_class("sim-rns-brand-version");
 
+    branding.append(&icon_container);
     branding.append(&product_title);
     branding.append(&version_label);
     actions_column.append(&branding);
