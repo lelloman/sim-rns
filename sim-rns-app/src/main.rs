@@ -1,16 +1,17 @@
 use gtk::prelude::ApplicationExtManual;
 use maruzzella::{
     build_application_with_handle, default_product_spec, load_static_plugin, plugin_tab,
-    LauncherSpec, MaruzzellaConfig, ShellMode, TabGroupSpec, WindowPolicy, WorkspaceSession,
-    WorkbenchNodeSpec,
+    LauncherSpec, MaruzzellaConfig, ShellMode, TabGroupSpec, WindowPolicy, WorkbenchNodeSpec,
+    WorkspaceSession,
 };
-use sim_rns_core::install_project_opener;
+use sim_rns_core::{install_project_opener, set_active_project_handle};
 
 fn main() {
     let mut product = default_product_spec();
     product.branding.title = "Sim RNS".to_string();
     product.branding.search_placeholder = "Search simulator views".to_string();
-    product.branding.status_text = "Selected local project loaded into the simulator scaffold".to_string();
+    product.branding.status_text =
+        "Selected local project loaded into the simulator scaffold".to_string();
     product.include_base_toolbar_items = true;
 
     product.layout.workbench = WorkbenchNodeSpec::Group(TabGroupSpec::new(
@@ -72,6 +73,7 @@ fn main() {
     let workspace_product = config.product.clone();
     let (app, handle) = build_application_with_handle(config);
     install_project_opener(move |project_handle| {
+        set_active_project_handle(Some(project_handle.clone()));
         let project_handle_bytes = project_handle.to_bytes()?;
         handle
             .switch_to_workspace(WorkspaceSession {

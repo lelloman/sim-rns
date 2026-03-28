@@ -1,7 +1,7 @@
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
-    gio, gdk, Align, Box as GtkBox, Button, CssProvider, Frame, Label, ListBox, ListBoxRow,
+    gdk, gio, Align, Box as GtkBox, Button, CssProvider, Frame, Label, ListBox, ListBoxRow,
     Orientation, Picture, PolicyType, ScrolledWindow, SelectionMode, Separator,
     STYLE_PROVIDER_PRIORITY_USER,
 };
@@ -10,8 +10,8 @@ use maruzzella_sdk::{
     PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
 };
 use sim_rns_core::{
-    create_project, load_project, open_project, sample_recipe, Element, LauncherConfig, Project,
-    ProjectHandle, Recipe, Template,
+    create_project, current_project, load_project, open_project, project_recipe,
+    set_active_project_handle, Element, LauncherConfig, Project, ProjectHandle, Recipe, Template,
 };
 
 const PLUGIN_ID: &str = "com.lelloman.sim_rns";
@@ -37,7 +37,10 @@ impl Plugin for SimRnsPlugin {
     }
 
     fn register(host: &HostApi<'_>) -> Result<(), MzStatusCode> {
-        host.log(maruzzella_sdk::ffi::MzLogLevel::Info, "Registering Sim RNS plugin");
+        host.log(
+            maruzzella_sdk::ffi::MzLogLevel::Info,
+            "Registering Sim RNS plugin",
+        );
 
         host.register_surface_contribution(SurfaceContributionSpec::about_section(
             PLUGIN_ID,
@@ -159,7 +162,12 @@ fn element_lines(element: &Element) -> Vec<String> {
     let resources = element
         .resources
         .as_ref()
-        .map(|limits| format!("{} MiB / cpu weight {}", limits.memory_mb, limits.cpu_weight))
+        .map(|limits| {
+            format!(
+                "{} MiB / cpu weight {}",
+                limits.memory_mb, limits.cpu_weight
+            )
+        })
         .unwrap_or_else(|| "template default".to_string());
     vec![
         format!("template = {}", element.template_id),
@@ -175,7 +183,10 @@ fn template_lines(template: &Template) -> Vec<String> {
         format!("category = {:?}", template.category),
         format!("extends = {}", template.extends.as_deref().unwrap_or("-")),
         format!("runtime = {:?}", template.runtime.family),
-        format!("image features = {}", template.runtime.image_features.join(", ")),
+        format!(
+            "image features = {}",
+            template.runtime.image_features.join(", ")
+        ),
         format!("default command = {}", template.defaults.command.join(" ")),
     ]
 }
@@ -346,22 +357,45 @@ fn build_panel_frame() -> (Frame, GtkBox) {
     (frame, content)
 }
 
-
 fn open_selected_project(
     host: &maruzzella_sdk::ffi::MzHostApi,
     project: &Project,
 ) -> Result<(), String> {
     let handle = project.handle();
+    set_active_project_handle(Some(handle.clone()));
     let mut config = load_config(host);
     config.remember_project(handle.clone());
     save_config(host, &config).map_err(|status| format!("failed to save recents: {status:?}"))?;
     open_project(handle)
 }
 
+fn load_workspace_project() -> Result<Project, String> {
+    current_project()
+}
+
+fn build_project_summary(project: &Project) -> Vec<String> {
+    vec![
+        format!("Project root = {}", project.root_path.display()),
+        format!(
+            "Project file = {}",
+            project.root_path.join("sim-rns.project.json").display()
+        ),
+        format!(
+            "Includes: {} node files, {} scripts, {} configs, {} assets",
+            project.file.includes.nodes.len(),
+            project.file.includes.scripts.len(),
+            project.file.includes.configs.len(),
+            project.file.includes.assets.len()
+        ),
+    ]
+}
+
 fn append_empty_recent_row(list: &ListBox) {
     list.append(&section_card(
         "No Recent Projects",
-        &[String::from("Create a project or open an existing sim-rns project.")],
+        &[String::from(
+            "Create a project or open an existing sim-rns project.",
+        )],
     ));
 }
 
@@ -592,10 +626,15 @@ extern "C" fn create_launcher_view(
                 return;
             };
             let Some(path) = file.path() else {
-                set_error(&error_label_for_dialog, "The selected location has no local path.");
+                set_error(
+                    &error_label_for_dialog,
+                    "The selected location has no local path.",
+                );
                 return;
             };
-            match load_project(&path).and_then(|project| open_selected_project(&host_for_dialog, &project)) {
+            match load_project(&path)
+                .and_then(|project| open_selected_project(&host_for_dialog, &project))
+            {
                 Ok(()) => {
                     refresh_recent_projects(
                         &recent_projects_for_dialog,
@@ -629,7 +668,10 @@ extern "C" fn create_launcher_view(
                 return;
             };
             let Some(path) = file.path() else {
-                set_error(&error_label_for_dialog, "The selected location has no local path.");
+                set_error(
+                    &error_label_for_dialog,
+                    "The selected location has no local path.",
+                );
                 return;
             };
 
@@ -670,18 +712,41 @@ extern "C" fn create_overview_view(
         return std::ptr::null_mut();
     }
 
-    let recipe = sample_recipe();
+    let project = match load_workspace_project() {
+        Ok(project) => project,
+        Err(error) => {
+            let root = build_root("Open a project", &error);
+            return unsafe {
+                <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+                    as *mut std::ffi::c_void
+            };
+        }
+    };
+    let recipe = match project_recipe(&project) {
+        Ok(recipe) => recipe,
+        Err(error) => {
+            let root = build_root("Project failed to load", &error);
+            return unsafe {
+                <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+                    as *mut std::ffi::c_void
+            };
+        }
+    };
     let root = build_root(
-        "Reticulum Network Simulator",
-        "The current implementation is a Maruzzella-hosted scaffold centered on recipe-driven VM initialization and template-backed elements.",
+        &project.file.name,
+        "The current workspace is now bound to the selected project root and derives its scaffold recipe from the root file plus imported project files.",
     );
     let list = ListBox::new();
     list.set_selection_mode(SelectionMode::None);
+    list.append(&section_card("Project", &build_project_summary(&project)));
     list.append(&section_card("Overview", &overview_lines(&recipe)));
     list.append(&section_card("Startup Order", &recipe.startup.order));
 
     for element in &recipe.elements {
-        list.append(&section_card(&format!("Element {}", element.id), &element_lines(element)));
+        list.append(&section_card(
+            &format!("Element {}", element.id),
+            &element_lines(element),
+        ));
     }
 
     let scroller = create_scroller();
@@ -702,10 +767,29 @@ extern "C" fn create_recipe_view(
         return std::ptr::null_mut();
     }
 
-    let recipe = sample_recipe();
+    let project = match load_workspace_project() {
+        Ok(project) => project,
+        Err(error) => {
+            let root = build_root("Open a project", &error);
+            return unsafe {
+                <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+                    as *mut std::ffi::c_void
+            };
+        }
+    };
+    let recipe = match project_recipe(&project) {
+        Ok(recipe) => recipe,
+        Err(error) => {
+            let root = build_root("Project failed to load", &error);
+            return unsafe {
+                <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+                    as *mut std::ffi::c_void
+            };
+        }
+    };
     let root = build_root(
-        "Recipe",
-        "Recipes are the structured DNA that initialize a project. They describe the VM envelope, templates, elements, topology, and startup order, but not the full evolving runtime state of the VM.",
+        "Project File",
+        "The root project file defines the VM envelope and imports companion files from the project tree. The recipe below is derived from that project definition, not stored as one monolithic blob.",
     );
     let list = ListBox::new();
     list.set_selection_mode(SelectionMode::None);
@@ -715,6 +799,15 @@ extern "C" fn create_recipe_view(
             format!("id = {}", recipe.metadata.id),
             format!("name = {}", recipe.metadata.name),
             format!("description = {}", recipe.metadata.description),
+        ],
+    ));
+    list.append(&section_card(
+        "Includes",
+        &[
+            format!("node files = {}", project.file.includes.nodes.join(", ")),
+            format!("scripts = {}", project.file.includes.scripts.join(", ")),
+            format!("configs = {}", project.file.includes.configs.join(", ")),
+            format!("assets = {}", project.file.includes.assets.join(", ")),
         ],
     ));
     list.append(&section_card(
@@ -754,10 +847,29 @@ extern "C" fn create_templates_view(
         return std::ptr::null_mut();
     }
 
-    let recipe = sample_recipe();
+    let project = match load_workspace_project() {
+        Ok(project) => project,
+        Err(error) => {
+            let root = build_root("Open a project", &error);
+            return unsafe {
+                <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+                    as *mut std::ffi::c_void
+            };
+        }
+    };
+    let recipe = match project_recipe(&project) {
+        Ok(recipe) => recipe,
+        Err(error) => {
+            let root = build_root("Project failed to load", &error);
+            return unsafe {
+                <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+                    as *mut std::ffi::c_void
+            };
+        }
+    };
     let root = build_root(
         "Templates",
-        "Templates are runtime/domain objects. The app uses template IDs to map icons and presentation separately from the recipe model.",
+        "Templates remain shared runtime definitions, while the current project selects and configures them through imported node and script files.",
     );
     let list = ListBox::new();
     list.set_selection_mode(SelectionMode::None);
