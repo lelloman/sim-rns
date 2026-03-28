@@ -4,7 +4,7 @@ use maruzzella::{
     LauncherSpec, MaruzzellaConfig, ShellMode, TabGroupSpec, WindowPolicy, WorkbenchNodeSpec,
     WorkspaceSession,
 };
-use sim_rns_core::{install_project_opener, set_active_project_handle};
+use sim_rns_core::{install_project_closer, install_project_opener, set_active_project_handle};
 
 fn main() {
     let mut product = default_product_spec();
@@ -72,6 +72,13 @@ fn main() {
 
     let workspace_product = config.product.clone();
     let (app, handle) = build_application_with_handle(config);
+    let launcher_handle = handle.clone();
+    install_project_closer(move || {
+        set_active_project_handle(None);
+        launcher_handle
+            .switch_to_launcher()
+            .map_err(|error| error.to_string())
+    });
     install_project_opener(move |project_handle| {
         set_active_project_handle(Some(project_handle.clone()));
         let project_handle_bytes = project_handle.to_bytes()?;

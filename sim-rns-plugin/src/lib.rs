@@ -10,8 +10,9 @@ use maruzzella_sdk::{
     PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
 };
 use sim_rns_core::{
-    create_project, current_project, load_project, open_project, project_recipe,
-    set_active_project_handle, Element, LauncherConfig, Project, ProjectHandle, Recipe, Template,
+    add_node_include, add_script_include, close_project, create_project, current_project,
+    load_project, open_project, project_recipe, set_active_project_handle, Element, LauncherConfig,
+    Project, ProjectHandle, Recipe, Template,
 };
 
 const PLUGIN_ID: &str = "com.lelloman.sim_rns";
@@ -101,6 +102,15 @@ fn build_root(title: &str, subtitle: &str) -> GtkBox {
     root.append(&title_label);
     root.append(&subtitle_label);
     root
+}
+
+fn workspace_error_label() -> Label {
+    let label = Label::new(None);
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.add_css_class("error");
+    label.set_visible(false);
+    label
 }
 
 fn create_scroller() -> ScrolledWindow {
@@ -388,6 +398,36 @@ fn build_project_summary(project: &Project) -> Vec<String> {
             project.file.includes.assets.len()
         ),
     ]
+}
+
+fn populate_overview_list(list: &ListBox, project: &Project, recipe: &Recipe) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+
+    list.append(&section_card("Project", &build_project_summary(project)));
+    list.append(&section_card("Overview", &overview_lines(recipe)));
+    list.append(&section_card("Startup Order", &recipe.startup.order));
+
+    for element in &recipe.elements {
+        list.append(&section_card(
+            &format!("Element {}", element.id),
+            &element_lines(element),
+        ));
+    }
+}
+
+fn reload_overview(list: &ListBox, error_label: &Label) {
+    match load_workspace_project().and_then(|project| {
+        let recipe = project_recipe(&project)?;
+        Ok((project, recipe))
+    }) {
+        Ok((project, recipe)) => {
+            populate_overview_list(list, &project, &recipe);
+            set_error(error_label, "");
+        }
+        Err(error) => set_error(error_label, &error),
+    }
 }
 
 fn append_empty_recent_row(list: &ListBox) {
@@ -736,22 +776,67 @@ extern "C" fn create_overview_view(
         &project.file.name,
         "The current workspace is now bound to the selected project root and derives its scaffold recipe from the root file plus imported project files.",
     );
+    let action_bar = GtkBox::new(Orientation::Horizontal, 8);
+    let close_project_button = Button::with_label("Close Project");
+    let add_script_button = Button::with_label("Add Script");
+    let add_node_button = Button::with_label("Add Node");
+    action_bar.append(&close_project_button);
+    action_bar.append(&add_script_button);
+    action_bar.append(&add_node_button);
+    root.append(&action_bar);
+
+    let error_label = workspace_error_label();
+    root.append(&error_label);
+
     let list = ListBox::new();
     list.set_selection_mode(SelectionMode::None);
-    list.append(&section_card("Project", &build_project_summary(&project)));
-    list.append(&section_card("Overview", &overview_lines(&recipe)));
-    list.append(&section_card("Startup Order", &recipe.startup.order));
-
-    for element in &recipe.elements {
-        list.append(&section_card(
-            &format!("Element {}", element.id),
-            &element_lines(element),
-        ));
-    }
+    populate_overview_list(&list, &project, &recipe);
 
     let scroller = create_scroller();
     scroller.set_child(Some(&list));
     root.append(&scroller);
+
+    let error_label_for_close = error_label.clone();
+    close_project_button.connect_clicked(move |_| match close_project() {
+        Ok(()) => set_error(&error_label_for_close, ""),
+        Err(error) => set_error(&error_label_for_close, &error),
+    });
+
+    let list_for_script = list.clone();
+    let error_label_for_script = error_label.clone();
+    add_script_button.connect_clicked(move |_| {
+        match load_workspace_project().and_then(|project| {
+            let (_updated, relative_path) = add_script_include(&project.root_path)?;
+            Ok(relative_path)
+        }) {
+            Ok(relative_path) => {
+                reload_overview(&list_for_script, &error_label_for_script);
+                set_error(
+                    &error_label_for_script,
+                    &format!("Added script include `{relative_path}`."),
+                );
+            }
+            Err(error) => set_error(&error_label_for_script, &error),
+        }
+    });
+
+    let list_for_node = list.clone();
+    let error_label_for_node = error_label.clone();
+    add_node_button.connect_clicked(move |_| {
+        match load_workspace_project().and_then(|project| {
+            let (_updated, relative_path) = add_node_include(&project.root_path)?;
+            Ok(relative_path)
+        }) {
+            Ok(relative_path) => {
+                reload_overview(&list_for_node, &error_label_for_node);
+                set_error(
+                    &error_label_for_node,
+                    &format!("Added node include `{relative_path}`."),
+                );
+            }
+            Err(error) => set_error(&error_label_for_node, &error),
+        }
+    });
 
     unsafe {
         <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())

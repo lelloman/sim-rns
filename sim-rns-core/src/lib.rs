@@ -266,9 +266,11 @@ impl LauncherConfig {
 }
 
 type ProjectOpenCallback = dyn Fn(ProjectHandle) -> Result<(), String> + 'static;
+type ProjectCloseCallback = dyn Fn() -> Result<(), String> + 'static;
 
 thread_local! {
     static PROJECT_OPENER: RefCell<Option<Box<ProjectOpenCallback>>> = RefCell::new(None);
+    static PROJECT_CLOSER: RefCell<Option<Box<ProjectCloseCallback>>> = RefCell::new(None);
     static ACTIVE_PROJECT_HANDLE: RefCell<Option<ProjectHandle>> = RefCell::new(None);
 }
 
@@ -281,6 +283,15 @@ where
     });
 }
 
+pub fn install_project_closer<F>(closer: F)
+where
+    F: Fn() -> Result<(), String> + 'static,
+{
+    PROJECT_CLOSER.with(|callback| {
+        callback.replace(Some(Box::new(closer)));
+    });
+}
+
 pub fn open_project(handle: ProjectHandle) -> Result<(), String> {
     PROJECT_OPENER.with(|callback| {
         let callback = callback.borrow();
@@ -288,6 +299,16 @@ pub fn open_project(handle: ProjectHandle) -> Result<(), String> {
             .as_ref()
             .ok_or_else(|| "project opener is not installed".to_string())?;
         opener(handle)
+    })
+}
+
+pub fn close_project() -> Result<(), String> {
+    PROJECT_CLOSER.with(|callback| {
+        let callback = callback.borrow();
+        let closer = callback
+            .as_ref()
+            .ok_or_else(|| "project closer is not installed".to_string())?;
+        closer()
     })
 }
 
@@ -430,6 +451,14 @@ pub fn create_project(root_path: impl AsRef<Path>, name: &str) -> Result<Project
         .map_err(|error| format!("failed to write {}: {error}", file_path.display()))?;
 
     Ok(Project { root_path, file })
+}
+
+fn write_project_file(project: &Project) -> Result<(), String> {
+    let file_path = project_file_path(&project.root_path);
+    let payload = serde_json::to_string_pretty(&project.file)
+        .map_err(|error| format!("failed to serialize project file: {error}"))?;
+    std::fs::write(&file_path, payload)
+        .map_err(|error| format!("failed to write {}: {error}", file_path.display()))
 }
 
 fn write_project_scaffold_files(root_path: &Path, project_id: &str) -> Result<(), String> {
@@ -673,6 +702,97 @@ pub fn project_recipe(project: &Project) -> Result<Recipe, String> {
         topology: Topology { attachments },
         startup,
     })
+}
+
+fn unique_project_entry_path(
+    root_path: &Path,
+    dir_name: &str,
+    stem: &str,
+    suffix: &str,
+) -> (String, PathBuf) {
+    for index in 1.. {
+        let file_name = format!("{stem}-{index}{suffix}");
+        let relative = format!("{dir_name}/{file_name}");
+        let absolute = root_path.join(&relative);
+        if !absolute.exists() {
+            return (relative, absolute);
+        }
+    }
+    unreachable!("the filesystem should eventually provide a free path")
+}
+
+pub fn add_script_include(project_root: impl AsRef<Path>) -> Result<(Project, String), String> {
+    let mut project = load_project(project_root)?;
+    let (relative_path, absolute_path) =
+        unique_project_entry_path(&project.root_path, PROJECT_SCRIPTS_DIR, "script", ".py");
+    let script_id = Path::new(&relative_path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(slugify_project_name)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("failed to derive a script id from {relative_path}"))?;
+
+    write_file(
+        absolute_path,
+        &format!("print(\"Sim RNS script stub: {script_id}\")\n"),
+    )?;
+    project.file.includes.scripts.push(relative_path.clone());
+    if !project
+        .file
+        .startup
+        .order
+        .iter()
+        .any(|entry| entry == &script_id)
+    {
+        project.file.startup.order.push(script_id);
+    }
+    project.file.updated_at_unix_ms = unix_time_ms()?;
+    write_project_file(&project)?;
+    Ok((project, relative_path))
+}
+
+pub fn add_node_include(project_root: impl AsRef<Path>) -> Result<(Project, String), String> {
+    let mut project = load_project(project_root)?;
+    let (relative_path, absolute_path) =
+        unique_project_entry_path(&project.root_path, PROJECT_NODES_DIR, "node", ".node.json");
+    let node_id = Path::new(&relative_path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(|value| value.trim_end_matches(".node"))
+        .map(slugify_project_name)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("failed to derive a node id from {relative_path}"))?;
+
+    write_pretty_json(
+        absolute_path,
+        &ProjectNodeFile {
+            id: node_id.clone(),
+            template_id: "rns.rs.backbone".to_string(),
+            enabled: true,
+            env: BTreeMap::from([("RNS_INSTANCE".to_string(), node_id.clone())]),
+            assets: Vec::new(),
+            restart_policy: Some(RestartPolicy::OnFailure),
+            resources: Some(ResourceLimits {
+                memory_mb: 256,
+                cpu_weight: 100,
+            }),
+            command_override: None,
+            attachments: vec!["lan-main".to_string()],
+        },
+    )?;
+    project.file.includes.nodes.push(relative_path.clone());
+    if !project
+        .file
+        .startup
+        .order
+        .iter()
+        .any(|entry| entry == &node_id)
+    {
+        project.file.startup.order.push(node_id);
+    }
+    project.file.updated_at_unix_ms = unix_time_ms()?;
+    write_project_file(&project)?;
+    Ok((project, relative_path))
 }
 
 fn unix_time_ms() -> Result<u64, String> {
@@ -987,10 +1107,10 @@ pub fn sample_recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_project, is_project_dir, load_project, normalize_local_project_path,
-        project_file_path, project_recipe, LauncherConfig, ProjectHandle, ProjectTransport,
-        PROJECT_ASSETS_DIR, PROJECT_CONFIGS_DIR, PROJECT_FILE_NAME, PROJECT_NODES_DIR,
-        PROJECT_SCRIPTS_DIR,
+        add_node_include, add_script_include, create_project, is_project_dir, load_project,
+        normalize_local_project_path, project_file_path, project_recipe, LauncherConfig,
+        ProjectHandle, ProjectTransport, PROJECT_ASSETS_DIR, PROJECT_CONFIGS_DIR,
+        PROJECT_FILE_NAME, PROJECT_NODES_DIR, PROJECT_SCRIPTS_DIR,
     };
 
     fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
@@ -1135,6 +1255,44 @@ mod tests {
             .any(|element| element.id == "traffic-seed" && element.template_id == "script.python"));
         assert_eq!(recipe.topology.attachments.len(), 2);
         assert_eq!(recipe.startup.order[0], "lan-main");
+
+        std::fs::remove_dir_all(&root).expect("temp dir should be removed");
+    }
+
+    #[test]
+    fn add_include_actions_extend_the_project_tree() {
+        let root = unique_test_dir("sim-rns-core-project-actions");
+        create_project(&root, "Action Test").expect("project should be created");
+
+        let (project_with_script, script_path) =
+            add_script_include(&root).expect("script include should be added");
+        assert!(root.join(&script_path).is_file());
+        assert!(project_with_script
+            .file
+            .includes
+            .scripts
+            .iter()
+            .any(|path| path == &script_path));
+
+        let (project_with_node, node_path) =
+            add_node_include(&root).expect("node include should be added");
+        assert!(root.join(&node_path).is_file());
+        assert!(project_with_node
+            .file
+            .includes
+            .nodes
+            .iter()
+            .any(|path| path == &node_path));
+
+        let recipe = project_recipe(&project_with_node).expect("recipe should still derive");
+        assert!(recipe
+            .elements
+            .iter()
+            .any(|element| element.id.starts_with("script-")));
+        assert!(recipe
+            .elements
+            .iter()
+            .any(|element| element.id.starts_with("node-")));
 
         std::fs::remove_dir_all(&root).expect("temp dir should be removed");
     }
