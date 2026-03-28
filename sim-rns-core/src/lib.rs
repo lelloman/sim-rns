@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -132,6 +133,9 @@ pub struct StartupPlan {
     pub order: Vec<String>,
 }
 
+pub const PROJECT_MANIFEST_FILENAME: &str = "sim-rns-project.json";
+const PROJECT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectTransport {
@@ -168,6 +172,33 @@ impl ProjectHandle {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         serde_json::from_slice(bytes)
             .map_err(|error| format!("failed to deserialize project handle: {error}"))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectManifest {
+    pub schema_version: u32,
+    pub project_id: String,
+    pub name: String,
+    pub description: String,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+    pub recipe: Recipe,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Project {
+    pub root_path: PathBuf,
+    pub manifest: ProjectManifest,
+}
+
+impl Project {
+    pub fn handle(&self) -> ProjectHandle {
+        ProjectHandle {
+            transport: ProjectTransport::Local,
+            path: self.root_path.to_string_lossy().into_owned(),
+            display_name: self.manifest.name.clone(),
+        }
     }
 }
 
@@ -222,6 +253,115 @@ pub fn normalize_local_project_path(path: &Path) -> Result<PathBuf, String> {
     }
     std::fs::canonicalize(path)
         .map_err(|error| format!("failed to resolve {}: {error}", path.display()))
+}
+
+pub fn project_manifest_path(root_path: impl AsRef<Path>) -> PathBuf {
+    root_path.as_ref().join(PROJECT_MANIFEST_FILENAME)
+}
+
+pub fn is_project_dir(path: impl AsRef<Path>) -> bool {
+    let root = path.as_ref();
+    root.is_dir() && project_manifest_path(root).is_file()
+}
+
+pub fn load_project(path: impl AsRef<Path>) -> Result<Project, String> {
+    let root_path = normalize_local_project_path(path.as_ref())?;
+    let manifest_path = project_manifest_path(&root_path);
+    let payload = std::fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("failed to read {}: {error}", manifest_path.display()))?;
+    let manifest: ProjectManifest = serde_json::from_str(&payload)
+        .map_err(|error| format!("failed to parse {}: {error}", manifest_path.display()))?;
+    if manifest.schema_version != PROJECT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported project schema version {} in {}",
+            manifest.schema_version,
+            manifest_path.display()
+        ));
+    }
+    Ok(Project { root_path, manifest })
+}
+
+pub fn create_project(root_path: impl AsRef<Path>, name: &str) -> Result<Project, String> {
+    let requested_root = root_path.as_ref();
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return Err("project name cannot be empty".to_string());
+    }
+
+    if requested_root.exists() {
+        if !requested_root.is_dir() {
+            return Err(format!("{} is not a directory", requested_root.display()));
+        }
+        let mut entries = std::fs::read_dir(requested_root)
+            .map_err(|error| format!("failed to inspect {}: {error}", requested_root.display()))?;
+        if entries.next().is_some() {
+            return Err(format!(
+                "{} is not empty; choose an empty directory for a new project",
+                requested_root.display()
+            ));
+        }
+    } else {
+        std::fs::create_dir_all(requested_root)
+            .map_err(|error| format!("failed to create {}: {error}", requested_root.display()))?;
+    }
+
+    let root_path = normalize_local_project_path(requested_root)?;
+    let timestamp = unix_time_ms()?;
+    let project_id = slugify_project_name(trimmed_name);
+    let mut recipe = sample_recipe();
+    recipe.metadata.id = project_id.clone();
+    recipe.metadata.name = trimmed_name.to_string();
+    recipe.metadata.description = format!("Starter recipe for project `{trimmed_name}`.");
+
+    let manifest = ProjectManifest {
+        schema_version: PROJECT_SCHEMA_VERSION,
+        project_id,
+        name: trimmed_name.to_string(),
+        description: "Local sim-rns project scaffold".to_string(),
+        created_at_unix_ms: timestamp,
+        updated_at_unix_ms: timestamp,
+        recipe,
+    };
+
+    let manifest_path = project_manifest_path(&root_path);
+    let payload = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| format!("failed to serialize project manifest: {error}"))?;
+    std::fs::write(&manifest_path, payload)
+        .map_err(|error| format!("failed to write {}: {error}", manifest_path.display()))?;
+
+    Ok(Project { root_path, manifest })
+}
+
+fn unix_time_ms() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .map_err(|error| format!("system clock error: {error}"))
+}
+
+fn slugify_project_name(name: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+
+    for character in name.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+            last_was_dash = false;
+        } else if !last_was_dash && !slug.is_empty() {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        "project".to_string()
+    } else {
+        slug
+    }
 }
 
 pub fn base_templates() -> Vec<Template> {
