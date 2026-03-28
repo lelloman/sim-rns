@@ -133,7 +133,11 @@ pub struct StartupPlan {
     pub order: Vec<String>,
 }
 
-pub const PROJECT_MANIFEST_FILENAME: &str = "sim-rns-project.json";
+pub const PROJECT_FILE_NAME: &str = "sim-rns.project.json";
+pub const PROJECT_CONFIGS_DIR: &str = "configs";
+pub const PROJECT_NODES_DIR: &str = "nodes";
+pub const PROJECT_SCRIPTS_DIR: &str = "scripts";
+pub const PROJECT_ASSETS_DIR: &str = "assets";
 const PROJECT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -176,7 +180,7 @@ impl ProjectHandle {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProjectManifest {
+pub struct ProjectFile {
     pub schema_version: u32,
     pub project_id: String,
     pub name: String,
@@ -189,7 +193,7 @@ pub struct ProjectManifest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Project {
     pub root_path: PathBuf,
-    pub manifest: ProjectManifest,
+    pub file: ProjectFile,
 }
 
 impl Project {
@@ -197,7 +201,7 @@ impl Project {
         ProjectHandle {
             transport: ProjectTransport::Local,
             path: self.root_path.to_string_lossy().into_owned(),
-            display_name: self.manifest.name.clone(),
+            display_name: self.file.name.clone(),
         }
     }
 }
@@ -255,30 +259,30 @@ pub fn normalize_local_project_path(path: &Path) -> Result<PathBuf, String> {
         .map_err(|error| format!("failed to resolve {}: {error}", path.display()))
 }
 
-pub fn project_manifest_path(root_path: impl AsRef<Path>) -> PathBuf {
-    root_path.as_ref().join(PROJECT_MANIFEST_FILENAME)
+pub fn project_file_path(root_path: impl AsRef<Path>) -> PathBuf {
+    root_path.as_ref().join(PROJECT_FILE_NAME)
 }
 
 pub fn is_project_dir(path: impl AsRef<Path>) -> bool {
     let root = path.as_ref();
-    root.is_dir() && project_manifest_path(root).is_file()
+    root.is_dir() && project_file_path(root).is_file()
 }
 
 pub fn load_project(path: impl AsRef<Path>) -> Result<Project, String> {
     let root_path = normalize_local_project_path(path.as_ref())?;
-    let manifest_path = project_manifest_path(&root_path);
-    let payload = std::fs::read_to_string(&manifest_path)
-        .map_err(|error| format!("failed to read {}: {error}", manifest_path.display()))?;
-    let manifest: ProjectManifest = serde_json::from_str(&payload)
-        .map_err(|error| format!("failed to parse {}: {error}", manifest_path.display()))?;
-    if manifest.schema_version != PROJECT_SCHEMA_VERSION {
+    let file_path = project_file_path(&root_path);
+    let payload = std::fs::read_to_string(&file_path)
+        .map_err(|error| format!("failed to read {}: {error}", file_path.display()))?;
+    let file: ProjectFile = serde_json::from_str(&payload)
+        .map_err(|error| format!("failed to parse {}: {error}", file_path.display()))?;
+    if file.schema_version != PROJECT_SCHEMA_VERSION {
         return Err(format!(
             "unsupported project schema version {} in {}",
-            manifest.schema_version,
-            manifest_path.display()
+            file.schema_version,
+            file_path.display()
         ));
     }
-    Ok(Project { root_path, manifest })
+    Ok(Project { root_path, file })
 }
 
 pub fn create_project(root_path: impl AsRef<Path>, name: &str) -> Result<Project, String> {
@@ -313,7 +317,7 @@ pub fn create_project(root_path: impl AsRef<Path>, name: &str) -> Result<Project
     recipe.metadata.name = trimmed_name.to_string();
     recipe.metadata.description = format!("Starter recipe for project `{trimmed_name}`.");
 
-    let manifest = ProjectManifest {
+    let file = ProjectFile {
         schema_version: PROJECT_SCHEMA_VERSION,
         project_id,
         name: trimmed_name.to_string(),
@@ -323,13 +327,28 @@ pub fn create_project(root_path: impl AsRef<Path>, name: &str) -> Result<Project
         recipe,
     };
 
-    let manifest_path = project_manifest_path(&root_path);
-    let payload = serde_json::to_string_pretty(&manifest)
-        .map_err(|error| format!("failed to serialize project manifest: {error}"))?;
-    std::fs::write(&manifest_path, payload)
-        .map_err(|error| format!("failed to write {}: {error}", manifest_path.display()))?;
+    for dir_name in [
+        PROJECT_CONFIGS_DIR,
+        PROJECT_NODES_DIR,
+        PROJECT_SCRIPTS_DIR,
+        PROJECT_ASSETS_DIR,
+    ] {
+        std::fs::create_dir_all(root_path.join(dir_name)).map_err(|error| {
+            format!(
+                "failed to create {} in {}: {error}",
+                dir_name,
+                root_path.display()
+            )
+        })?;
+    }
 
-    Ok(Project { root_path, manifest })
+    let file_path = project_file_path(&root_path);
+    let payload = serde_json::to_string_pretty(&file)
+        .map_err(|error| format!("failed to serialize project file: {error}"))?;
+    std::fs::write(&file_path, payload)
+        .map_err(|error| format!("failed to write {}: {error}", file_path.display()))?;
+
+    Ok(Project { root_path, file })
 }
 
 fn unix_time_ms() -> Result<u64, String> {
@@ -637,7 +656,19 @@ pub fn sample_recipe() -> Recipe {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_local_project_path, LauncherConfig, ProjectHandle, ProjectTransport};
+    use super::{
+        create_project, is_project_dir, load_project, normalize_local_project_path,
+        project_file_path, LauncherConfig, ProjectHandle, ProjectTransport, PROJECT_ASSETS_DIR,
+        PROJECT_CONFIGS_DIR, PROJECT_FILE_NAME, PROJECT_NODES_DIR, PROJECT_SCRIPTS_DIR,
+    };
+
+    fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
 
     #[test]
     fn project_handle_round_trips_through_bytes() {
@@ -682,10 +713,7 @@ mod tests {
 
     #[test]
     fn local_project_path_validation_requires_existing_directory() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "sim-rns-core-test-{}",
-            std::process::id()
-        ));
+        let temp_dir = unique_test_dir("sim-rns-core-path-test");
         std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
 
         let normalized =
@@ -696,5 +724,38 @@ mod tests {
         assert!(normalize_local_project_path(&missing).is_err());
 
         std::fs::remove_dir_all(&temp_dir).expect("temp dir should be removed");
+    }
+
+    #[test]
+    fn create_and_load_project_round_trip() {
+        let root = unique_test_dir("sim-rns-core-project-test");
+        let created = create_project(&root, "Mesh Lab").expect("project should be created");
+
+        assert_eq!(created.file.name, "Mesh Lab");
+        assert!(project_file_path(&root).ends_with(PROJECT_FILE_NAME));
+        assert!(is_project_dir(&root));
+        assert!(root.join(PROJECT_CONFIGS_DIR).is_dir());
+        assert!(root.join(PROJECT_NODES_DIR).is_dir());
+        assert!(root.join(PROJECT_SCRIPTS_DIR).is_dir());
+        assert!(root.join(PROJECT_ASSETS_DIR).is_dir());
+
+        let loaded = load_project(&root).expect("project should load");
+        assert_eq!(loaded.file.name, "Mesh Lab");
+        assert_eq!(loaded.file.project_id, "mesh-lab");
+        assert_eq!(loaded.handle().display_name, "Mesh Lab");
+
+        std::fs::remove_dir_all(&root).expect("temp dir should be removed");
+    }
+
+    #[test]
+    fn create_project_rejects_non_empty_directory() {
+        let root = unique_test_dir("sim-rns-core-project-nonempty");
+        std::fs::create_dir_all(&root).expect("temp dir should be created");
+        std::fs::write(root.join("notes.txt"), "occupied").expect("temp file should be written");
+
+        let error = create_project(&root, "Busy Project").expect_err("creation should fail");
+        assert!(error.contains("not empty"));
+
+        std::fs::remove_dir_all(&root).expect("temp dir should be removed");
     }
 }

@@ -10,7 +10,8 @@ use maruzzella_sdk::{
     PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
 };
 use sim_rns_core::{
-    open_project, sample_recipe, Element, LauncherConfig, ProjectHandle, Recipe, Template,
+    create_project, load_project, open_project, sample_recipe, Element, LauncherConfig, Project,
+    ProjectHandle, Recipe, Template,
 };
 
 const PLUGIN_ID: &str = "com.lelloman.sim_rns";
@@ -348,8 +349,9 @@ fn build_panel_frame() -> (Frame, GtkBox) {
 
 fn open_selected_project(
     host: &maruzzella_sdk::ffi::MzHostApi,
-    handle: ProjectHandle,
+    project: &Project,
 ) -> Result<(), String> {
+    let handle = project.handle();
     let mut config = load_config(host);
     config.remember_project(handle.clone());
     save_config(host, &config).map_err(|status| format!("failed to save recents: {status:?}"))?;
@@ -359,9 +361,7 @@ fn open_selected_project(
 fn append_empty_recent_row(list: &ListBox) {
     list.append(&section_card(
         "No Recent Projects",
-        &[String::from(
-            "Open a local directory once and it will appear here for quick re-entry.",
-        )],
+        &[String::from("Create a project or open an existing sim-rns project.")],
     ));
 }
 
@@ -404,8 +404,11 @@ fn append_recent_row(
             set_error(&error_copy, "Launcher host API is unavailable.");
             return;
         };
-        if let Err(error) = open_selected_project(host_ref, project_copy.clone()) {
-            set_error(&error_copy, &error);
+        match load_project(&project_copy.path)
+            .and_then(|project| open_selected_project(host_ref, &project))
+        {
+            Ok(()) => set_error(&error_copy, ""),
+            Err(error) => set_error(&error_copy, &error),
         }
     });
 
@@ -561,13 +564,12 @@ extern "C" fn create_launcher_view(
     open_remote.add_css_class("sim-rns-action-btn");
     open_remote.set_sensitive(false);
 
-    let create_project = Button::with_label("Create New Project");
-    create_project.add_css_class("sim-rns-action-btn");
-    create_project.set_sensitive(false);
+    let create_project_button = Button::with_label("Create New Project");
+    create_project_button.add_css_class("sim-rns-action-btn");
 
     actions_box.append(&open_local);
     actions_box.append(&open_remote);
-    actions_box.append(&create_project);
+    actions_box.append(&create_project_button);
     actions_column.append(&actions_box);
 
     let host_copy = *host_ref;
@@ -593,8 +595,53 @@ extern "C" fn create_launcher_view(
                 set_error(&error_label_for_dialog, "The selected location has no local path.");
                 return;
             };
-            match ProjectHandle::for_local_dir(&path)
-                .and_then(|handle| open_selected_project(&host_for_dialog, handle))
+            match load_project(&path).and_then(|project| open_selected_project(&host_for_dialog, &project)) {
+                Ok(()) => {
+                    refresh_recent_projects(
+                        &recent_projects_for_dialog,
+                        &host_for_dialog,
+                        &error_label_for_dialog,
+                    );
+                    set_error(&error_label_for_dialog, "");
+                }
+                Err(error) => set_error(&error_label_for_dialog, &error),
+            }
+        });
+    });
+
+    let host_copy = *host_ref;
+    let recent_projects_copy = recent_projects.clone();
+    let error_label_copy = error_label.clone();
+    create_project_button.connect_clicked(move |button| {
+        set_error(&error_label_copy, "");
+        let dialog = gtk::FileDialog::builder()
+            .title("Create New Project")
+            .initial_folder(&gio::File::for_path(current_dir_or_home()))
+            .build();
+        let parent = button
+            .root()
+            .and_then(|root| root.downcast::<gtk::Window>().ok());
+        let host_for_dialog = host_copy;
+        let recent_projects_for_dialog = recent_projects_copy.clone();
+        let error_label_for_dialog = error_label_copy.clone();
+        dialog.select_folder(parent.as_ref(), gio::Cancellable::NONE, move |result| {
+            let Ok(file) = result else {
+                return;
+            };
+            let Some(path) = file.path() else {
+                set_error(&error_label_for_dialog, "The selected location has no local path.");
+                return;
+            };
+
+            let project_name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("Sim RNS Project")
+                .to_string();
+
+            match create_project(&path, &project_name)
+                .and_then(|project| open_selected_project(&host_for_dialog, &project))
             {
                 Ok(()) => {
                     refresh_recent_projects(
