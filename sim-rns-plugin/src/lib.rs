@@ -1,13 +1,14 @@
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
-    gdk, gio, Align, Box as GtkBox, Button, CssProvider, Frame, Label, ListBox, ListBoxRow,
-    Orientation, Picture, PolicyType, ScrolledWindow, SelectionMode, Separator,
-    STYLE_PROVIDER_PRIORITY_USER,
+    gdk, gio, Align, Box as GtkBox, Button, CssProvider, FileChooserAction, FileChooserDialog,
+    Frame, Label, ListBox, ListBoxRow, Orientation, Picture, PolicyType, ResponseType,
+    ScrolledWindow, SelectionMode, Separator,
 };
 use maruzzella_sdk::{
-    export_plugin, HostApi, MzStatusCode, MzViewPlacement, Plugin, PluginDependency,
-    PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
+    button_css_class, export_plugin, surface_css_class, text_css_class, HostApi, MzStatusCode,
+    MzViewPlacement, Plugin, PluginDependency, PluginDescriptor, SurfaceContributionSpec, Version,
+    ViewFactorySpec,
 };
 use sim_rns_core::{
     add_node_include, add_script_include, close_project, create_project, current_project,
@@ -214,10 +215,40 @@ fn save_config(
     HostApi::from_raw(host).write_json_config(config, Some(CONFIG_SCHEMA_VERSION))
 }
 
-fn current_dir_or_home() -> std::path::PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| {
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
-    })
+fn home_dir_or_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
+}
+
+fn prompt_directory_picker(
+    parent: Option<&gtk::Window>,
+    title: &str,
+    confirm_label: &str,
+    initial_path: &std::path::Path,
+    on_selected: impl Fn(std::path::PathBuf) + 'static,
+) {
+    let dialog = FileChooserDialog::new(
+        Some(title),
+        parent,
+        FileChooserAction::SelectFolder,
+        &[("Cancel", ResponseType::Cancel), (confirm_label, ResponseType::Accept)],
+    );
+    dialog.add_css_class("app-dialog");
+    dialog.set_modal(true);
+    if initial_path.is_dir() {
+        let initial_folder = gio::File::for_path(initial_path);
+        let _ = dialog.set_current_folder(Some(&initial_folder));
+    }
+    dialog.connect_response(move |dialog, response| {
+        if response == ResponseType::Accept {
+            if let Some(file) = dialog.file() {
+                if let Some(path) = file.path() {
+                    on_selected(path);
+                }
+            }
+        }
+        dialog.close();
+    });
+    dialog.show();
 }
 
 fn set_error(label: &Label, message: &str) {
@@ -229,117 +260,41 @@ fn install_launcher_css() {
     let provider = CssProvider::new();
     provider.load_from_data(
         "
-        .sim-rns-launcher {
-            padding: 0;
+        .sim-rns-launcher-action {
+            min-width: 240px;
+            min-height: 42px;
+            border-radius: 10px;
+            transition: background 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
         }
-        .sim-rns-launcher-header {
-            margin-bottom: 0;
+        .sim-rns-launcher-action:hover {
+            box-shadow: inset 0 0 0 9999px alpha(currentColor, 0.05);
         }
-        .sim-rns-launcher-title {
-            font-size: 20px;
-            font-weight: 700;
-            letter-spacing: -0.01em;
+        .sim-rns-launcher-action:active {
+            box-shadow: inset 0 0 0 9999px alpha(currentColor, 0.10);
         }
-
-        /* --- Recents column (left sidebar) --- */
-        .sim-rns-recents-column {
-            padding: 20px 16px;
+        .sim-rns-launcher-action-primary:hover {
+            box-shadow: inset 0 0 0 9999px alpha(white, 0.08);
+        }
+        .sim-rns-launcher-action-primary:active {
+            box-shadow: inset 0 0 0 9999px alpha(black, 0.12);
+        }
+        .sim-rns-launcher-action-secondary:hover {
+            box-shadow: inset 0 0 0 9999px alpha(currentColor, 0.07);
+        }
+        .sim-rns-launcher-action-secondary:active {
+            box-shadow: inset 0 0 0 9999px alpha(currentColor, 0.12);
         }
         .sim-rns-recents-panel {
             border-radius: 0;
-            background: transparent;
             box-shadow: none;
             border: none;
-        }
-        .sim-rns-recents-title {
-            font-size: 13px;
-            font-weight: 700;
-            letter-spacing: 0.04em;
-            opacity: 0.55;
-            text-transform: uppercase;
-        }
-        .sim-rns-recents-list {
-            background: transparent;
-        }
-        .sim-rns-recents-list row {
-            margin: 0;
-            padding: 0;
-            border-radius: 8px;
-            background: transparent;
-            transition: background 150ms ease;
-        }
-        .sim-rns-recents-list row:hover {
-            background: alpha(currentColor, 0.06);
-        }
-        .sim-rns-recent-row {
-            padding: 10px 12px;
-        }
-        .sim-rns-recent-info {
-            min-width: 0;
-        }
-        .sim-rns-recent-title {
-            font-size: 14px;
-            font-weight: 600;
-        }
-        .sim-rns-recent-path {
-            font-size: 11px;
-            opacity: 0.50;
-            font-family: monospace;
         }
         .sim-rns-recent-open-btn {
             opacity: 0;
             transition: opacity 150ms ease;
-            min-height: 28px;
-            min-width: 56px;
-            font-size: 12px;
         }
         .sim-rns-recents-list row:hover .sim-rns-recent-open-btn {
             opacity: 1;
-        }
-
-        /* --- Right column: branding + actions --- */
-        .sim-rns-actions-column {
-            padding: 24px 28px;
-        }
-        .sim-rns-branding {
-            padding: 16px;
-        }
-        .sim-rns-brand-title {
-            font-size: 28px;
-            font-weight: 800;
-            letter-spacing: 0.08em;
-        }
-        .sim-rns-brand-version {
-            font-size: 13px;
-            font-weight: 500;
-            opacity: 0.5;
-            letter-spacing: 0.04em;
-        }
-        .sim-rns-actions-box {
-            padding: 16px;
-        }
-        .sim-rns-action-btn {
-            min-height: 40px;
-            min-width: 240px;
-            font-weight: 600;
-            font-size: 14px;
-            border-radius: 8px;
-        }
-
-        /* --- Divider between columns --- */
-        .sim-rns-column-divider {
-            background: alpha(currentColor, 0.10);
-            min-width: 1px;
-        }
-
-        .sim-rns-error {
-            margin: 8px 16px 0 16px;
-            padding: 8px 12px;
-            border-radius: 6px;
-            background: alpha(@error_color, 0.10);
-            color: @error_color;
-            font-weight: 600;
-            font-size: 13px;
         }
         ",
     );
@@ -347,7 +302,7 @@ fn install_launcher_css() {
         gtk::style_context_add_provider_for_display(
             &display,
             &provider,
-            STYLE_PROVIDER_PRIORITY_USER + 1,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     }
 }
@@ -447,21 +402,23 @@ fn append_recent_row(
 ) {
     let row = ListBoxRow::new();
     let hbox = GtkBox::new(Orientation::Horizontal, 12);
-    hbox.add_css_class("sim-rns-recent-row");
+    hbox.set_margin_top(4);
+    hbox.set_margin_bottom(4);
+    hbox.set_margin_start(8);
+    hbox.set_margin_end(8);
 
     let info = GtkBox::new(Orientation::Vertical, 2);
     info.set_hexpand(true);
-    info.add_css_class("sim-rns-recent-info");
 
     let title = Label::new(Some(&project.display_name));
     title.set_xalign(0.0);
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title.add_css_class("sim-rns-recent-title");
+    title.add_css_class(&text_css_class("body-strong"));
 
     let path = Label::new(Some(&project.path));
     path.set_xalign(0.0);
     path.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    path.add_css_class("sim-rns-recent-path");
+    path.add_css_class(&text_css_class("meta"));
 
     info.append(&title);
     info.append(&path);
@@ -531,12 +488,11 @@ extern "C" fn create_launcher_view(
     install_launcher_css();
 
     let root = GtkBox::new(Orientation::Vertical, 0);
-    root.add_css_class("sim-rns-launcher");
 
     let error_label = Label::new(None);
     error_label.set_xalign(0.0);
     error_label.set_wrap(true);
-    error_label.add_css_class("sim-rns-error");
+    error_label.add_css_class("error");
     error_label.set_visible(false);
     root.append(&error_label);
 
@@ -549,19 +505,22 @@ extern "C" fn create_launcher_view(
     let recents_column = GtkBox::new(Orientation::Vertical, 12);
     recents_column.set_size_request(320, -1);
     recents_column.set_vexpand(true);
-    recents_column.add_css_class("sim-rns-recents-column");
+    recents_column.set_margin_top(20);
+    recents_column.set_margin_bottom(20);
+    recents_column.set_margin_start(16);
+    recents_column.set_margin_end(16);
+    recents_column.add_css_class(&surface_css_class("secondary"));
     body.append(&recents_column);
 
     let recents_header = GtkBox::new(Orientation::Horizontal, 8);
     let recents_title = Label::new(Some("Recent Projects"));
     recents_title.set_xalign(0.0);
     recents_title.set_hexpand(true);
-    recents_title.add_css_class("sim-rns-recents-title");
+    recents_title.add_css_class(&text_css_class("section-label"));
     recents_header.append(&recents_title);
     recents_column.append(&recents_header);
 
     let recent_projects = ListBox::new();
-    recent_projects.add_css_class("sim-rns-recents-list");
     recent_projects.set_selection_mode(SelectionMode::None);
     refresh_recent_projects(&recent_projects, host, &error_label);
 
@@ -580,7 +539,6 @@ extern "C" fn create_launcher_view(
 
     // --- Vertical divider ---
     let divider = Separator::new(Orientation::Vertical);
-    divider.add_css_class("sim-rns-column-divider");
     body.append(&divider);
 
     // --- Right column: Branding (top) + Actions (bottom) ---
@@ -588,7 +546,10 @@ extern "C" fn create_launcher_view(
     actions_column.set_size_request(480, -1);
     actions_column.set_hexpand(true);
     actions_column.set_vexpand(true);
-    actions_column.add_css_class("sim-rns-actions-column");
+    actions_column.set_margin_top(24);
+    actions_column.set_margin_bottom(24);
+    actions_column.set_margin_start(28);
+    actions_column.set_margin_end(28);
     body.append(&actions_column);
 
     // Top half: branding, centered
@@ -596,7 +557,6 @@ extern "C" fn create_launcher_view(
     branding.set_vexpand(true);
     branding.set_valign(Align::Center);
     branding.set_halign(Align::Center);
-    branding.add_css_class("sim-rns-branding");
 
     let icon_bytes = gtk::glib::Bytes::from_static(include_bytes!("../../sim-rns-icon.svg"));
     let icon_texture = gdk::Texture::from_bytes(&icon_bytes).expect("failed to load app icon");
@@ -613,10 +573,10 @@ extern "C" fn create_launcher_view(
     icon_container.append(&icon_picture);
 
     let product_title = Label::new(Some("SIM RNS"));
-    product_title.add_css_class("sim-rns-brand-title");
+    product_title.add_css_class(&text_css_class("title"));
 
     let version_label = Label::new(Some("v0.1.0"));
-    version_label.add_css_class("sim-rns-brand-version");
+    version_label.add_css_class(&text_css_class("meta"));
 
     branding.append(&icon_container);
     branding.append(&product_title);
@@ -628,18 +588,22 @@ extern "C" fn create_launcher_view(
     actions_box.set_vexpand(true);
     actions_box.set_valign(Align::Center);
     actions_box.set_halign(Align::Center);
-    actions_box.add_css_class("sim-rns-actions-box");
 
     let open_local = Button::with_label("Open Local Project");
-    open_local.add_css_class("suggested-action");
-    open_local.add_css_class("sim-rns-action-btn");
+    open_local.add_css_class(&button_css_class("primary"));
+    open_local.add_css_class("sim-rns-launcher-action");
+    open_local.add_css_class("sim-rns-launcher-action-primary");
 
     let open_remote = Button::with_label("Open Remote Project");
-    open_remote.add_css_class("sim-rns-action-btn");
+    open_remote.add_css_class(&button_css_class("secondary"));
+    open_remote.add_css_class("sim-rns-launcher-action");
+    open_remote.add_css_class("sim-rns-launcher-action-secondary");
     open_remote.set_sensitive(false);
 
     let create_project_button = Button::with_label("Create New Project");
-    create_project_button.add_css_class("sim-rns-action-btn");
+    create_project_button.add_css_class(&button_css_class("secondary"));
+    create_project_button.add_css_class("sim-rns-launcher-action");
+    create_project_button.add_css_class("sim-rns-launcher-action-secondary");
 
     actions_box.append(&open_local);
     actions_box.append(&open_remote);
@@ -651,41 +615,40 @@ extern "C" fn create_launcher_view(
     let error_label_copy = error_label.clone();
     open_local.connect_clicked(move |button| {
         set_error(&error_label_copy, "");
-        let dialog = gtk::FileDialog::builder()
-            .title("Open Local Project")
-            .initial_folder(&gio::File::for_path(current_dir_or_home()))
-            .build();
         let parent = button
             .root()
             .and_then(|root| root.downcast::<gtk::Window>().ok());
         let host_for_dialog = host_copy;
         let recent_projects_for_dialog = recent_projects_copy.clone();
         let error_label_for_dialog = error_label_copy.clone();
-        dialog.select_folder(parent.as_ref(), gio::Cancellable::NONE, move |result| {
-            let Ok(file) = result else {
-                return;
-            };
-            let Some(path) = file.path() else {
-                set_error(
-                    &error_label_for_dialog,
-                    "The selected location has no local path.",
-                );
-                return;
-            };
-            match load_project(&path)
-                .and_then(|project| open_selected_project(&host_for_dialog, &project))
-            {
-                Ok(()) => {
-                    refresh_recent_projects(
-                        &recent_projects_for_dialog,
-                        &host_for_dialog,
+        prompt_directory_picker(
+            parent.as_ref(),
+            "Open Local Project",
+            "Open",
+            &home_dir_or_root(),
+            move |path| {
+                if path.as_os_str().is_empty() {
+                    set_error(
                         &error_label_for_dialog,
+                        "The selected location has no local path.",
                     );
-                    set_error(&error_label_for_dialog, "");
+                    return;
                 }
-                Err(error) => set_error(&error_label_for_dialog, &error),
-            }
-        });
+                match load_project(&path)
+                    .and_then(|project| open_selected_project(&host_for_dialog, &project))
+                {
+                    Ok(()) => {
+                        refresh_recent_projects(
+                            &recent_projects_for_dialog,
+                            &host_for_dialog,
+                            &error_label_for_dialog,
+                        );
+                        set_error(&error_label_for_dialog, "");
+                    }
+                    Err(error) => set_error(&error_label_for_dialog, &error),
+                }
+            },
+        );
     });
 
     let host_copy = *host_ref;
@@ -693,49 +656,48 @@ extern "C" fn create_launcher_view(
     let error_label_copy = error_label.clone();
     create_project_button.connect_clicked(move |button| {
         set_error(&error_label_copy, "");
-        let dialog = gtk::FileDialog::builder()
-            .title("Create New Project")
-            .initial_folder(&gio::File::for_path(current_dir_or_home()))
-            .build();
         let parent = button
             .root()
             .and_then(|root| root.downcast::<gtk::Window>().ok());
         let host_for_dialog = host_copy;
         let recent_projects_for_dialog = recent_projects_copy.clone();
         let error_label_for_dialog = error_label_copy.clone();
-        dialog.select_folder(parent.as_ref(), gio::Cancellable::NONE, move |result| {
-            let Ok(file) = result else {
-                return;
-            };
-            let Some(path) = file.path() else {
-                set_error(
-                    &error_label_for_dialog,
-                    "The selected location has no local path.",
-                );
-                return;
-            };
-
-            let project_name = path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .filter(|value| !value.is_empty())
-                .unwrap_or("Sim RNS Project")
-                .to_string();
-
-            match create_project(&path, &project_name)
-                .and_then(|project| open_selected_project(&host_for_dialog, &project))
-            {
-                Ok(()) => {
-                    refresh_recent_projects(
-                        &recent_projects_for_dialog,
-                        &host_for_dialog,
+        prompt_directory_picker(
+            parent.as_ref(),
+            "Create New Project",
+            "Create",
+            &home_dir_or_root(),
+            move |path| {
+                if path.as_os_str().is_empty() {
+                    set_error(
                         &error_label_for_dialog,
+                        "The selected location has no local path.",
                     );
-                    set_error(&error_label_for_dialog, "");
+                    return;
                 }
-                Err(error) => set_error(&error_label_for_dialog, &error),
-            }
-        });
+
+                let project_name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("Sim RNS Project")
+                    .to_string();
+
+                match create_project(&path, &project_name)
+                    .and_then(|project| open_selected_project(&host_for_dialog, &project))
+                {
+                    Ok(()) => {
+                        refresh_recent_projects(
+                            &recent_projects_for_dialog,
+                            &host_for_dialog,
+                            &error_label_for_dialog,
+                        );
+                        set_error(&error_label_for_dialog, "");
+                    }
+                    Err(error) => set_error(&error_label_for_dialog, &error),
+                }
+            },
+        );
     });
 
     unsafe {
