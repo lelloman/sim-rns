@@ -1,18 +1,18 @@
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
-    gdk, gio, Align, Box as GtkBox, Button, CssProvider, FileChooserAction, FileChooserDialog,
+    gio, Align, Box as GtkBox, Button, CssProvider, FileChooserAction, FileChooserDialog,
     Frame, Label, ListBox, ListBoxRow, Orientation, Picture, PolicyType, ResponseType,
     ScrolledWindow, SelectionMode, Separator,
 };
 use maruzzella_sdk::{
     button_css_class, export_plugin, surface_css_class, text_css_class, HostApi, MzStatusCode,
-    MzViewPlacement, Plugin, PluginDependency, PluginDescriptor, SurfaceContributionSpec, Version,
-    ViewFactorySpec,
+    MzViewPlacement, Plugin, PluginDependency, PluginDescriptor,
+    SurfaceContributionSpec, Version, ViewFactorySpec,
 };
 use sim_rns_core::{
     add_node_include, add_script_include, close_project, create_project, current_project,
-    load_project, open_project, project_recipe, set_active_project_handle, Element, LauncherConfig,
+    load_project, project_recipe, set_active_project_handle, Element, LauncherConfig,
     Project, ProjectHandle, Recipe, Template,
 };
 
@@ -208,13 +208,6 @@ fn load_config(host: &maruzzella_sdk::ffi::MzHostApi) -> LauncherConfig {
         .unwrap_or_default()
 }
 
-fn save_config(
-    host: &maruzzella_sdk::ffi::MzHostApi,
-    config: &LauncherConfig,
-) -> Result<(), MzStatusCode> {
-    HostApi::from_raw(host).write_json_config(config, Some(CONFIG_SCHEMA_VERSION))
-}
-
 fn home_dir_or_root() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
 }
@@ -226,6 +219,7 @@ fn prompt_directory_picker(
     initial_path: &std::path::Path,
     on_selected: impl Fn(std::path::PathBuf) + 'static,
 ) {
+    let on_selected = std::rc::Rc::new(on_selected) as std::rc::Rc<dyn Fn(std::path::PathBuf)>;
     let dialog = FileChooserDialog::new(
         Some(title),
         parent,
@@ -239,14 +233,16 @@ fn prompt_directory_picker(
         let _ = dialog.set_current_folder(Some(&initial_folder));
     }
     dialog.connect_response(move |dialog, response| {
-        if response == ResponseType::Accept {
-            if let Some(file) = dialog.file() {
-                if let Some(path) = file.path() {
-                    on_selected(path);
-                }
-            }
-        }
+        let selected_path = if response == ResponseType::Accept {
+            dialog.file().and_then(|file| file.path())
+        } else {
+            None
+        };
         dialog.close();
+        if let Some(path) = selected_path {
+            let on_selected = on_selected.clone();
+            gtk::glib::idle_add_local_once(move || on_selected(path));
+        }
     });
     dialog.show();
 }
@@ -254,6 +250,24 @@ fn prompt_directory_picker(
 fn set_error(label: &Label, message: &str) {
     label.set_label(message);
     label.set_visible(!message.is_empty());
+}
+
+fn host_api_log(
+    host: &maruzzella_sdk::ffi::MzHostApi,
+    level: maruzzella_sdk::ffi::MzLogLevel,
+    message: &str,
+) {
+    if let Some(log) = host.log {
+        log(
+            level,
+            maruzzella_sdk::ffi::MzStr {
+                ptr: message.as_ptr(),
+                len: message.len(),
+            },
+        );
+    } else {
+        eprintln!("{message}");
+    }
 }
 
 fn install_launcher_css() {
@@ -326,12 +340,76 @@ fn open_selected_project(
     host: &maruzzella_sdk::ffi::MzHostApi,
     project: &Project,
 ) -> Result<(), String> {
+    const SWITCH_TO_WORKSPACE_COMMAND: &str = "shell.switch_to_workspace";
     let handle = project.handle();
+    host_api_log(
+        host,
+        maruzzella_sdk::ffi::MzLogLevel::Info,
+        &format!(
+            "sim-rns: open_selected_project path={} display_name={}",
+            handle.path, handle.display_name
+        ),
+    );
     set_active_project_handle(Some(handle.clone()));
+    let host_api = HostApi::from_raw(host);
     let mut config = load_config(host);
     config.remember_project(handle.clone());
-    save_config(host, &config).map_err(|status| format!("failed to save recents: {status:?}"))?;
-    open_project(handle)
+    if let Err(status) = host_api.write_json_config(&config, Some(CONFIG_SCHEMA_VERSION)) {
+        host_api_log(
+            host,
+            maruzzella_sdk::ffi::MzLogLevel::Warn,
+            &format!("sim-rns: failed to save recents, continuing: {status:?}"),
+        );
+    }
+    let project_handle_bytes = handle.to_bytes()?;
+    host_api_log(
+        host,
+        maruzzella_sdk::ffi::MzLogLevel::Info,
+        &format!(
+            "sim-rns: dispatching {} payload_len={}",
+            SWITCH_TO_WORKSPACE_COMMAND,
+            project_handle_bytes.len()
+        ),
+    );
+    let Some(dispatch_command) = host.dispatch_command else {
+        host_api_log(
+            host,
+            maruzzella_sdk::ffi::MzLogLevel::Error,
+            "sim-rns: host command dispatcher is unavailable",
+        );
+        return Err("host command dispatcher is unavailable".to_string());
+    };
+    let status = dispatch_command(
+        maruzzella_sdk::ffi::MzStr {
+            ptr: SWITCH_TO_WORKSPACE_COMMAND.as_ptr(),
+            len: SWITCH_TO_WORKSPACE_COMMAND.len(),
+        },
+        maruzzella_sdk::ffi::MzBytes {
+            ptr: project_handle_bytes.as_ptr(),
+            len: project_handle_bytes.len(),
+        },
+    );
+    if !status.is_ok() {
+        host_api_log(
+            host,
+            maruzzella_sdk::ffi::MzLogLevel::Error,
+            &format!(
+                "sim-rns: {} failed with status={:?}",
+                SWITCH_TO_WORKSPACE_COMMAND,
+                status.code
+            ),
+        );
+        return Err(format!(
+            "failed to switch to workspace via host command: {:?}",
+            status.code
+        ));
+    }
+    host_api_log(
+        host,
+        maruzzella_sdk::ffi::MzLogLevel::Info,
+        "sim-rns: shell.switch_to_workspace dispatched successfully",
+    );
+    Ok(())
 }
 
 fn load_workspace_project() -> Result<Project, String> {
@@ -558,9 +636,9 @@ extern "C" fn create_launcher_view(
     branding.set_valign(Align::Center);
     branding.set_halign(Align::Center);
 
-    let icon_bytes = gtk::glib::Bytes::from_static(include_bytes!("../../sim-rns-icon.svg"));
-    let icon_texture = gdk::Texture::from_bytes(&icon_bytes).expect("failed to load app icon");
-    let icon_picture = Picture::for_paintable(&icon_texture);
+    let icon_file =
+        gio::File::for_path(concat!(env!("CARGO_MANIFEST_DIR"), "/../sim-rns-icon.svg"));
+    let icon_picture = Picture::for_file(&icon_file);
     icon_picture.set_can_shrink(true);
     icon_picture.set_halign(Align::Center);
     icon_picture.set_valign(Align::Center);
