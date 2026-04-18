@@ -37,6 +37,9 @@ fn main() {
     product.include_base_toolbar_items = true;
     product.menu_roots = root_menu_roots();
     product.menu_items = root_menu_items();
+    if let Err(error) = sync_persisted_root_menu(&product.menu_roots, &product.menu_items) {
+        eprintln!("sim-rns: failed to update persisted root menu: {error}");
+    }
 
     product.layout.workbench = WorkbenchNodeSpec::Group(TabGroupSpec::new(
         "workbench-main",
@@ -285,4 +288,65 @@ fn project_session_path() -> Option<std::path::PathBuf> {
                 .join("sim-rns")
                 .join("session.json")
         })
+}
+
+fn sync_persisted_root_menu(roots: &[MenuRootSpec], items: &[MenuItemSpec]) -> Result<(), String> {
+    for path in persisted_layout_paths() {
+        if path.is_file() {
+            sync_persisted_root_menu_at(&path, roots, items)?;
+        }
+    }
+    Ok(())
+}
+
+fn sync_persisted_root_menu_at(
+    path: &std::path::Path,
+    roots: &[MenuRootSpec],
+    items: &[MenuItemSpec],
+) -> Result<(), String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let mut value = serde_json::from_str::<serde_json::Value>(&raw)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+    let spec = value
+        .get_mut("spec")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| format!("{} does not contain a shell spec", path.display()))?;
+    spec.insert(
+        "menu_roots".to_string(),
+        serde_json::to_value(roots)
+            .map_err(|error| format!("failed to encode root menus: {error}"))?,
+    );
+    spec.insert(
+        "menu_items".to_string(),
+        serde_json::to_value(items)
+            .map_err(|error| format!("failed to encode menu items: {error}"))?,
+    );
+    let updated = serde_json::to_string_pretty(&value)
+        .map_err(|error| format!("failed to encode {}: {error}", path.display()))?;
+    std::fs::write(path, updated)
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+fn persisted_layout_paths() -> Vec<std::path::PathBuf> {
+    let Some(root) = user_config_root() else {
+        return Vec::new();
+    };
+    vec![
+        root.join("sim-rns--workspace").join("layout.json"),
+        root.join("sim-rns").join("layout.json"),
+    ]
+}
+
+fn user_config_root() -> Option<std::path::PathBuf> {
+    if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME") {
+        let trimmed = config_home.trim();
+        if !trimmed.is_empty() {
+            return Some(std::path::PathBuf::from(trimmed));
+        }
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|home| !home.trim().is_empty())
+        .map(|home| std::path::PathBuf::from(home).join(".config"))
 }
