@@ -2,7 +2,7 @@ use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
     gio, Align, Box as GtkBox, Button, CssProvider, FileChooserAction, FileChooserDialog,
-    Frame, Label, ListBox, ListBoxRow, Orientation, Picture, PolicyType, ResponseType,
+    Frame, GestureClick, Label, ListBox, ListBoxRow, Orientation, Picture, PolicyType, ResponseType,
     ScrolledWindow, SelectionMode, Separator,
 };
 use maruzzella_sdk::{
@@ -203,19 +203,62 @@ fn template_lines(template: &Template) -> Vec<String> {
 }
 
 fn load_config(host: &maruzzella_sdk::ffi::MzHostApi) -> LauncherConfig {
-    HostApi::from_raw(host)
-        .read_json_config::<LauncherConfig>()
-        .unwrap_or_default()
+    if host.read_config_record.is_some() {
+        if let Ok(config) = HostApi::from_raw(host).read_json_config::<LauncherConfig>() {
+            return config;
+        }
+    }
+    read_local_launcher_config().unwrap_or_default()
 }
 
 fn save_config(
     host: &maruzzella_sdk::ffi::MzHostApi,
     config: &LauncherConfig,
 ) -> Result<(), MzStatusCode> {
-    if host.write_config_record.is_none() {
-        return Err(MzStatusCode::NotFound);
+    if host.write_config_record.is_some() {
+        return HostApi::from_raw(host).write_json_config(config, Some(CONFIG_SCHEMA_VERSION));
     }
-    HostApi::from_raw(host).write_json_config(config, Some(CONFIG_SCHEMA_VERSION))
+    write_local_launcher_config(config)
+}
+
+fn local_launcher_config_path() -> Option<std::path::PathBuf> {
+    if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME") {
+        let trimmed = config_home.trim();
+        if !trimmed.is_empty() {
+            return Some(std::path::PathBuf::from(trimmed).join("sim-rns/launcher.json"));
+        }
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|home| !home.trim().is_empty())
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join(".config")
+                .join("sim-rns")
+                .join("launcher.json")
+        })
+}
+
+fn read_local_launcher_config() -> Result<LauncherConfig, MzStatusCode> {
+    let Some(path) = local_launcher_config_path() else {
+        return Ok(LauncherConfig::default());
+    };
+    if !path.is_file() {
+        return Ok(LauncherConfig::default());
+    }
+    let payload = std::fs::read_to_string(path).map_err(|_| MzStatusCode::InternalError)?;
+    serde_json::from_str(&payload).map_err(|_| MzStatusCode::InternalError)
+}
+
+fn write_local_launcher_config(config: &LauncherConfig) -> Result<(), MzStatusCode> {
+    let Some(path) = local_launcher_config_path() else {
+        return Err(MzStatusCode::NotFound);
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| MzStatusCode::InternalError)?;
+    }
+    let payload = serde_json::to_string_pretty(config).map_err(|_| MzStatusCode::InternalError)?;
+    std::fs::write(path, payload).map_err(|_| MzStatusCode::InternalError)
 }
 
 fn home_dir_or_root() -> std::path::PathBuf {
@@ -365,7 +408,7 @@ fn open_selected_project(
         let (level, message) = if status == MzStatusCode::NotFound {
             (
                 maruzzella_sdk::ffi::MzLogLevel::Info,
-                "sim-rns: recents persistence is unavailable in this host context".to_string(),
+                "sim-rns: recents persistence is unavailable".to_string(),
             )
         } else {
             (
@@ -456,13 +499,26 @@ fn append_empty_recent_row(list: &ListBox) {
     ));
 }
 
+fn open_recent_project(
+    host: &maruzzella_sdk::ffi::MzHostApi,
+    project: &ProjectHandle,
+    error_label: &Label,
+) {
+    match load_project(&project.path).and_then(|project| open_selected_project(host, &project)) {
+        Ok(()) => set_error(error_label, ""),
+        Err(error) => set_error(error_label, &error),
+    }
+}
+
 fn append_recent_row(
     list: &ListBox,
-    host: *const maruzzella_sdk::ffi::MzHostApi,
+    host: maruzzella_sdk::ffi::MzHostApi,
     project: &ProjectHandle,
     error_label: &Label,
 ) {
     let row = ListBoxRow::new();
+    row.set_activatable(true);
+    row.set_selectable(false);
     let hbox = GtkBox::new(Orientation::Horizontal, 12);
     hbox.set_margin_top(4);
     hbox.set_margin_bottom(4);
@@ -485,24 +541,31 @@ fn append_recent_row(
     info.append(&title);
     info.append(&path);
 
+    let info_click = GestureClick::new();
+    let info_host = host;
+    let info_project = project.clone();
+    let info_error = error_label.clone();
+    info_click.connect_released(move |_, _, _, _| {
+        open_recent_project(&info_host, &info_project, &info_error);
+    });
+    info.add_controller(info_click);
+
     let button = Button::with_label("Open");
     button.set_valign(Align::Center);
     button.add_css_class("sim-rns-recent-open-btn");
 
-    let host_copy = host;
-    let project_copy = project.clone();
-    let error_copy = error_label.clone();
+    let button_host = host;
+    let button_project = project.clone();
+    let button_error = error_label.clone();
     button.connect_clicked(move |_| {
-        let Some(host_ref) = (unsafe { host_copy.as_ref() }) else {
-            set_error(&error_copy, "Launcher host API is unavailable.");
-            return;
-        };
-        match load_project(&project_copy.path)
-            .and_then(|project| open_selected_project(host_ref, &project))
-        {
-            Ok(()) => set_error(&error_copy, ""),
-            Err(error) => set_error(&error_copy, &error),
-        }
+        open_recent_project(&button_host, &button_project, &button_error);
+    });
+
+    let row_host = host;
+    let row_project = project.clone();
+    let row_error = error_label.clone();
+    row.connect_activate(move |_| {
+        open_recent_project(&row_host, &row_project, &row_error);
     });
 
     hbox.append(&info);
@@ -533,7 +596,7 @@ fn refresh_recent_projects(
     }
 
     for project in &config.recent_projects {
-        append_recent_row(list, host, project, error_label);
+        append_recent_row(list, *host_ref, project, error_label);
     }
 }
 
@@ -584,6 +647,8 @@ extern "C" fn create_launcher_view(
 
     let recent_projects = ListBox::new();
     recent_projects.set_selection_mode(SelectionMode::None);
+    recent_projects.set_activate_on_single_click(true);
+    recent_projects.add_css_class("sim-rns-recents-list");
     refresh_recent_projects(&recent_projects, host, &error_label);
 
     let (recents_frame, recents_panel) = build_panel_frame();
