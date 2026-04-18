@@ -12,7 +12,7 @@ use maruzzella_sdk::{
 };
 use sim_rns_core::{
     add_node_include, add_script_include, close_project, create_project, current_project,
-    load_project, project_recipe, set_active_project_handle, Element, LauncherConfig,
+    load_project, open_project, project_recipe, Element, LauncherConfig,
     Project, ProjectHandle, Recipe, Template,
 };
 
@@ -208,6 +208,16 @@ fn load_config(host: &maruzzella_sdk::ffi::MzHostApi) -> LauncherConfig {
         .unwrap_or_default()
 }
 
+fn save_config(
+    host: &maruzzella_sdk::ffi::MzHostApi,
+    config: &LauncherConfig,
+) -> Result<(), MzStatusCode> {
+    if host.write_config_record.is_none() {
+        return Err(MzStatusCode::NotFound);
+    }
+    HostApi::from_raw(host).write_json_config(config, Some(CONFIG_SCHEMA_VERSION))
+}
+
 fn home_dir_or_root() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
 }
@@ -340,7 +350,6 @@ fn open_selected_project(
     host: &maruzzella_sdk::ffi::MzHostApi,
     project: &Project,
 ) -> Result<(), String> {
-    const SWITCH_TO_WORKSPACE_COMMAND: &str = "shell.switch_to_workspace";
     let handle = project.handle();
     host_api_log(
         host,
@@ -350,64 +359,39 @@ fn open_selected_project(
             handle.path, handle.display_name
         ),
     );
-    set_active_project_handle(Some(handle.clone()));
-    let host_api = HostApi::from_raw(host);
     let mut config = load_config(host);
     config.remember_project(handle.clone());
-    if let Err(status) = host_api.write_json_config(&config, Some(CONFIG_SCHEMA_VERSION)) {
-        host_api_log(
-            host,
-            maruzzella_sdk::ffi::MzLogLevel::Warn,
-            &format!("sim-rns: failed to save recents, continuing: {status:?}"),
-        );
-    }
-    let project_handle_bytes = handle.to_bytes()?;
-    host_api_log(
-        host,
-        maruzzella_sdk::ffi::MzLogLevel::Info,
-        &format!(
-            "sim-rns: dispatching {} payload_len={}",
-            SWITCH_TO_WORKSPACE_COMMAND,
-            project_handle_bytes.len()
-        ),
-    );
-    let Some(dispatch_command) = host.dispatch_command else {
-        host_api_log(
-            host,
-            maruzzella_sdk::ffi::MzLogLevel::Error,
-            "sim-rns: host command dispatcher is unavailable",
-        );
-        return Err("host command dispatcher is unavailable".to_string());
-    };
-    let status = dispatch_command(
-        maruzzella_sdk::ffi::MzStr {
-            ptr: SWITCH_TO_WORKSPACE_COMMAND.as_ptr(),
-            len: SWITCH_TO_WORKSPACE_COMMAND.len(),
-        },
-        maruzzella_sdk::ffi::MzBytes {
-            ptr: project_handle_bytes.as_ptr(),
-            len: project_handle_bytes.len(),
-        },
-    );
-    if !status.is_ok() {
-        host_api_log(
-            host,
-            maruzzella_sdk::ffi::MzLogLevel::Error,
-            &format!(
-                "sim-rns: {} failed with status={:?}",
-                SWITCH_TO_WORKSPACE_COMMAND,
-                status.code
-            ),
-        );
-        return Err(format!(
-            "failed to switch to workspace via host command: {:?}",
-            status.code
-        ));
+    if let Err(status) = save_config(host, &config) {
+        let (level, message) = if status == MzStatusCode::NotFound {
+            (
+                maruzzella_sdk::ffi::MzLogLevel::Info,
+                "sim-rns: recents persistence is unavailable in this host context".to_string(),
+            )
+        } else {
+            (
+                maruzzella_sdk::ffi::MzLogLevel::Warn,
+                format!("sim-rns: failed to save recents, continuing: {status:?}"),
+            )
+        };
+        host_api_log(host, level, &message);
     }
     host_api_log(
         host,
         maruzzella_sdk::ffi::MzLogLevel::Info,
-        "sim-rns: shell.switch_to_workspace dispatched successfully",
+        "sim-rns: opening project through installed project opener",
+    );
+    if let Err(error) = open_project(handle) {
+        host_api_log(
+            host,
+            maruzzella_sdk::ffi::MzLogLevel::Error,
+            &format!("sim-rns: project opener failed: {error}"),
+        );
+        return Err(error);
+    }
+    host_api_log(
+        host,
+        maruzzella_sdk::ffi::MzLogLevel::Info,
+        "sim-rns: project opened successfully",
     );
     Ok(())
 }
