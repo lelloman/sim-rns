@@ -4,9 +4,31 @@ use maruzzella::{
     LauncherSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, ShellMode, TabGroupSpec,
     WindowPolicy, WorkbenchNodeSpec, WorkspaceSession,
 };
-use sim_rns_core::{install_project_closer, install_project_opener, set_active_project_handle};
+use serde::{Deserialize, Serialize};
+use sim_rns_core::{
+    install_project_closer, install_project_opener, load_project, set_active_project_handle,
+    ProjectHandle,
+};
+
+const SESSION_SCHEMA_VERSION: u32 = 1;
+const MAIN_WINDOW_ID: &str = "main";
+const WORKSPACE_LAYOUT_SLOT: &str = "workspace";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AppSession {
+    schema_version: u32,
+    windows: Vec<AppSessionWindow>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AppSessionWindow {
+    id: String,
+    project: Option<ProjectHandle>,
+    layout_slot: String,
+}
 
 fn main() {
+    let restored_project = load_saved_project_session();
     let mut product = default_product_spec();
     product.branding.title = "Sim RNS".to_string();
     product.branding.search_placeholder = "Search simulator views".to_string();
@@ -66,17 +88,26 @@ fn main() {
 
     let config = MaruzzellaConfig::new("com.lelloman.sim-rns")
         .with_persistence_id("sim-rns")
-        .with_startup_mode(ShellMode::Launcher)
+        .with_startup_mode(if restored_project.is_some() {
+            ShellMode::Workspace
+        } else {
+            ShellMode::Launcher
+        })
         .with_launcher(launcher)
         .with_launcher_window_policy(WindowPolicy::new(980, 720))
         .with_product(product)
         .with_builtin_plugin(embedded_sim_rns_plugin);
+
+    if let Some(project_handle) = restored_project.clone() {
+        set_active_project_handle(Some(project_handle));
+    }
 
     let workspace_product = config.product.clone();
     let (app, handle) = build_application_with_handle(config);
     let launcher_handle = handle.clone();
     install_project_closer(move || {
         set_active_project_handle(None);
+        clear_saved_project_session();
         launcher_handle
             .switch_to_launcher()
             .map_err(|error| error.to_string())
@@ -84,13 +115,21 @@ fn main() {
     install_project_opener(move |project_handle| {
         set_active_project_handle(Some(project_handle.clone()));
         let project_handle_bytes = project_handle.to_bytes()?;
-        handle
+        let result = handle
             .switch_to_workspace(WorkspaceSession {
                 project_handle: Some(project_handle_bytes),
                 shell_spec: Some(workspace_product.shell_spec()),
                 window_policy: None,
             })
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string());
+        if result.is_ok() {
+            if let Err(error) = save_project_session(&project_handle) {
+                eprintln!("sim-rns: failed to save project session: {error}");
+            }
+        } else {
+            set_active_project_handle(None);
+        }
+        result
     });
     app.run();
 }
@@ -177,4 +216,73 @@ fn menu_item(id: &str, root_id: &str, label: &str, command_id: &str) -> MenuItem
 
 fn menu_separator(id: &str, root_id: &str) -> MenuItemSpec {
     menu_item(id, root_id, "", "")
+}
+
+fn load_saved_project_session() -> Option<ProjectHandle> {
+    let path = project_session_path()?;
+    let payload = std::fs::read_to_string(path).ok()?;
+    let session = serde_json::from_str::<AppSession>(&payload).ok()?;
+    if session.schema_version != SESSION_SCHEMA_VERSION {
+        clear_saved_project_session();
+        return None;
+    }
+    let handle = session
+        .windows
+        .into_iter()
+        .find(|window| window.id == MAIN_WINDOW_ID)
+        .and_then(|window| window.project)?;
+    if load_project(&handle.path).is_ok() {
+        Some(handle)
+    } else {
+        clear_saved_project_session();
+        None
+    }
+}
+
+fn save_project_session(handle: &ProjectHandle) -> Result<(), String> {
+    let path = project_session_path()
+        .ok_or_else(|| "no user config directory is available".to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    let session = AppSession {
+        schema_version: SESSION_SCHEMA_VERSION,
+        windows: vec![AppSessionWindow {
+            id: MAIN_WINDOW_ID.to_string(),
+            project: Some(handle.clone()),
+            layout_slot: WORKSPACE_LAYOUT_SLOT.to_string(),
+        }],
+    };
+    let payload = serde_json::to_vec_pretty(&session)
+        .map_err(|error| format!("failed to serialize app session: {error}"))?;
+    std::fs::write(&path, payload)
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+fn clear_saved_project_session() {
+    let Some(path) = project_session_path() else {
+        return;
+    };
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn project_session_path() -> Option<std::path::PathBuf> {
+    if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME") {
+        let trimmed = config_home.trim();
+        if !trimmed.is_empty() {
+            return Some(std::path::PathBuf::from(trimmed).join("sim-rns/session.json"));
+        }
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|home| !home.trim().is_empty())
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join(".config")
+                .join("sim-rns")
+                .join("session.json")
+        })
 }

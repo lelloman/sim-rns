@@ -603,6 +603,8 @@ version = "0.1.0"
 dependencies = [
  "gtk4",
  "maruzzella",
+ "serde",
+ "serde_json",
  "sim-rns-core",
  "sim-rns-plugin",
 ]
