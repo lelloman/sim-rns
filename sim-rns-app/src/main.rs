@@ -1,8 +1,8 @@
 use gtk::prelude::ApplicationExtManual;
 use maruzzella::{
     build_application_with_handle, default_product_spec, load_static_plugin, plugin_tab,
-    LauncherSpec, MaruzzellaConfig, ShellMode, TabGroupSpec, WindowPolicy, WorkbenchNodeSpec,
-    WorkspaceSession,
+    LauncherSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, ShellMode, TabGroupSpec,
+    WindowPolicy, WorkbenchNodeSpec, WorkspaceSession,
 };
 use sim_rns_core::{install_project_closer, install_project_opener, set_active_project_handle};
 
@@ -13,6 +13,8 @@ fn main() {
     product.branding.status_text =
         "Selected local project loaded into the simulator scaffold".to_string();
     product.include_base_toolbar_items = true;
+    product.menu_roots = root_menu_roots();
+    product.menu_items = root_menu_items();
 
     product.layout.workbench = WorkbenchNodeSpec::Group(TabGroupSpec::new(
         "workbench-main",
@@ -98,4 +100,81 @@ fn embedded_sim_rns_plugin() -> Result<maruzzella::LoadedPlugin, maruzzella::Plu
         "builtin:sim-rns-plugin",
         sim_rns_plugin::maruzzella_plugin_entry,
     )
+}
+
+fn root_menu_roots() -> Vec<MenuRootSpec> {
+    vec![
+        MenuRootSpec {
+            id: "file".to_string(),
+            label: "File".to_string(),
+        },
+        MenuRootSpec {
+            id: "view".to_string(),
+            label: "View".to_string(),
+        },
+        MenuRootSpec {
+            id: "help".to_string(),
+            label: "Help".to_string(),
+        },
+    ]
+}
+
+fn root_menu_items() -> Vec<MenuItemSpec> {
+    vec![
+        menu_item(
+            "sim-rns.project.new",
+            "file",
+            "New Project",
+            "sim-rns.project.new",
+        ),
+        menu_item(
+            "sim-rns.project.open",
+            "file",
+            "Open Project",
+            "sim-rns.project.open",
+        ),
+        menu_item(
+            "sim-rns.project.close",
+            "file",
+            "Close Project",
+            "sim-rns.project.close",
+        ),
+        menu_separator("file-project-separator", "file"),
+        menu_item("new-buffer", "file", "New Buffer", "shell.new_buffer"),
+        menu_item("save-buffer", "file", "Save Buffer", "shell.save_buffer"),
+        menu_item(
+            "save-buffer-as",
+            "file",
+            "Save Buffer as",
+            "shell.save_buffer_as",
+        ),
+        menu_separator("file-buffer-separator", "file"),
+        menu_item("settings", "file", "Settings", "shell.settings"),
+        menu_item("plugins", "file", "Plugins", "shell.plugins"),
+        menu_separator("file-shell-separator", "file"),
+        menu_item("sim-rns.app.exit", "file", "Exit", "sim-rns.app.exit"),
+        menu_item(
+            "command-palette",
+            "view",
+            "Command Palette",
+            "shell.open_command_palette",
+        ),
+        menu_item("reload-theme", "view", "Reload Theme", "shell.reload_theme"),
+        menu_item("browse-views", "view", "Browse Views", "shell.browse_views"),
+        menu_item("about", "help", "About", "shell.about"),
+    ]
+}
+
+fn menu_item(id: &str, root_id: &str, label: &str, command_id: &str) -> MenuItemSpec {
+    MenuItemSpec {
+        id: id.to_string(),
+        root_id: root_id.to_string(),
+        label: label.to_string(),
+        command_id: command_id.to_string(),
+        payload: Vec::new(),
+    }
+}
+
+fn menu_separator(id: &str, root_id: &str) -> MenuItemSpec {
+    menu_item(id, root_id, "", "")
 }

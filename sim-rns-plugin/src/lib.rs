@@ -1,19 +1,20 @@
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
-    gio, Align, Box as GtkBox, Button, CssProvider, FileChooserAction, FileChooserDialog,
-    Frame, GestureClick, Label, ListBox, ListBoxRow, Orientation, Picture, PolicyType, ResponseType,
+    gio, Align, Box as GtkBox, Button, CssProvider, FileChooserAction, FileChooserDialog, Frame,
+    GestureClick, Label, ListBox, ListBoxRow, Orientation, Picture, PolicyType, ResponseType,
     ScrolledWindow, SelectionMode, Separator,
 };
+use maruzzella_sdk::ffi::{MzBytes, MzStatus};
 use maruzzella_sdk::{
-    button_css_class, export_plugin, surface_css_class, text_css_class, HostApi, MzStatusCode,
-    MzViewPlacement, Plugin, PluginDependency, PluginDescriptor,
+    button_css_class, export_plugin, surface_css_class, text_css_class, CommandSpec, HostApi,
+    MzStatusCode, MzViewPlacement, Plugin, PluginDependency, PluginDescriptor,
     SurfaceContributionSpec, Version, ViewFactorySpec,
 };
 use sim_rns_core::{
     add_node_include, add_script_include, close_project, create_project, current_project,
-    load_project, open_project, project_recipe, Element, LauncherConfig,
-    Project, ProjectHandle, Recipe, Template,
+    load_project, open_project, project_recipe, Element, LauncherConfig, Project, ProjectHandle,
+    Recipe, Template,
 };
 
 const PLUGIN_ID: &str = "com.lelloman.sim_rns";
@@ -22,6 +23,10 @@ const VIEW_LAUNCHER: &str = "com.lelloman.sim_rns.launcher";
 const VIEW_OVERVIEW: &str = "com.lelloman.sim_rns.overview";
 const VIEW_RECIPE: &str = "com.lelloman.sim_rns.recipe";
 const VIEW_TEMPLATES: &str = "com.lelloman.sim_rns.templates";
+const CMD_NEW_PROJECT: &str = "sim-rns.project.new";
+const CMD_OPEN_PROJECT: &str = "sim-rns.project.open";
+const CMD_CLOSE_PROJECT: &str = "sim-rns.project.close";
+const CMD_EXIT_APP: &str = "sim-rns.app.exit";
 
 pub struct SimRnsPlugin;
 
@@ -50,6 +55,22 @@ impl Plugin for SimRnsPlugin {
             "Sim RNS",
             "VM-backed Reticulum network simulator hosted inside Maruzzella.",
         ))?;
+
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_NEW_PROJECT, "New Project")
+                .with_handler(open_project_launcher_command),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_OPEN_PROJECT, "Open Project")
+                .with_handler(open_project_launcher_command),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_CLOSE_PROJECT, "Close Project")
+                .with_handler(close_project_command),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_EXIT_APP, "Exit").with_handler(exit_app_command),
+        )?;
 
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
@@ -82,6 +103,26 @@ impl Plugin for SimRnsPlugin {
 
         Ok(())
     }
+}
+
+extern "C" fn open_project_launcher_command(_payload: MzBytes) -> MzStatus {
+    close_project_command(MzBytes::empty())
+}
+
+extern "C" fn close_project_command(_payload: MzBytes) -> MzStatus {
+    match close_project() {
+        Ok(()) => MzStatus::OK,
+        Err(_) => MzStatus::new(MzStatusCode::InternalError),
+    }
+}
+
+extern "C" fn exit_app_command(_payload: MzBytes) -> MzStatus {
+    if let Some(application) = gio::Application::default() {
+        application.quit();
+    } else {
+        std::process::exit(0);
+    }
+    MzStatus::OK
 }
 
 fn build_root(title: &str, subtitle: &str) -> GtkBox {
@@ -277,7 +318,10 @@ fn prompt_directory_picker(
         Some(title),
         parent,
         FileChooserAction::SelectFolder,
-        &[("Cancel", ResponseType::Cancel), (confirm_label, ResponseType::Accept)],
+        &[
+            ("Cancel", ResponseType::Cancel),
+            (confirm_label, ResponseType::Accept),
+        ],
     );
     dialog.add_css_class("app-dialog");
     dialog.set_modal(true);
