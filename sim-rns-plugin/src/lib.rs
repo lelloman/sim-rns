@@ -1,9 +1,9 @@
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
-    gio, Align, Box as GtkBox, Button, CssProvider, FileChooserAction, FileChooserDialog, Frame,
-    GestureClick, Label, ListBox, ListBoxRow, Orientation, Picture, PolicyType, ResponseType,
-    ScrolledWindow, SelectionMode, Separator,
+    gio, Align, Box as GtkBox, Button, FileChooserAction, FileChooserDialog, Frame, GestureClick,
+    Label, ListBox, ListBoxRow, Orientation, Picture, PolicyType, ResponseType, ScrolledWindow,
+    SelectionMode, Separator,
 };
 use maruzzella_sdk::ffi::{MzBytes, MzStatus};
 use maruzzella_sdk::{
@@ -367,57 +367,6 @@ fn host_api_log(
     }
 }
 
-fn install_launcher_css() {
-    let provider = CssProvider::new();
-    provider.load_from_data(
-        "
-        .sim-rns-launcher-action {
-            min-width: 240px;
-            min-height: 42px;
-            border-radius: 10px;
-            transition: background 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
-        }
-        .sim-rns-launcher-action:hover {
-            box-shadow: inset 0 0 0 9999px alpha(currentColor, 0.05);
-        }
-        .sim-rns-launcher-action:active {
-            box-shadow: inset 0 0 0 9999px alpha(currentColor, 0.10);
-        }
-        .sim-rns-launcher-action-primary:hover {
-            box-shadow: inset 0 0 0 9999px alpha(white, 0.08);
-        }
-        .sim-rns-launcher-action-primary:active {
-            box-shadow: inset 0 0 0 9999px alpha(black, 0.12);
-        }
-        .sim-rns-launcher-action-secondary:hover {
-            box-shadow: inset 0 0 0 9999px alpha(currentColor, 0.07);
-        }
-        .sim-rns-launcher-action-secondary:active {
-            box-shadow: inset 0 0 0 9999px alpha(currentColor, 0.12);
-        }
-        .sim-rns-recents-panel {
-            border-radius: 0;
-            box-shadow: none;
-            border: none;
-        }
-        .sim-rns-recent-open-btn {
-            opacity: 0;
-            transition: opacity 150ms ease;
-        }
-        .sim-rns-recents-list row:hover .sim-rns-recent-open-btn {
-            opacity: 1;
-        }
-        ",
-    );
-    if let Some(display) = gtk::gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-    }
-}
-
 fn build_panel_frame() -> (Frame, GtkBox) {
     let frame = Frame::new(None);
     frame.set_hexpand(true);
@@ -596,7 +545,7 @@ fn append_recent_row(
 
     let button = Button::with_label("Open");
     button.set_valign(Align::Center);
-    button.add_css_class("sim-rns-recent-open-btn");
+    button.add_css_class(&button_css_class("secondary"));
 
     let button_host = host;
     let button_project = project.clone();
@@ -654,8 +603,6 @@ extern "C" fn create_launcher_view(
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
         return std::ptr::null_mut();
     }
-    install_launcher_css();
-
     let root = GtkBox::new(Orientation::Vertical, 0);
 
     let error_label = Label::new(None);
@@ -692,11 +639,9 @@ extern "C" fn create_launcher_view(
     let recent_projects = ListBox::new();
     recent_projects.set_selection_mode(SelectionMode::None);
     recent_projects.set_activate_on_single_click(true);
-    recent_projects.add_css_class("sim-rns-recents-list");
     refresh_recent_projects(&recent_projects, host, &error_label);
 
     let (recents_frame, recents_panel) = build_panel_frame();
-    recents_frame.add_css_class("sim-rns-recents-panel");
     recents_panel.set_spacing(0);
     recents_panel.set_margin_top(0);
     recents_panel.set_margin_bottom(0);
@@ -762,19 +707,13 @@ extern "C" fn create_launcher_view(
 
     let open_local = Button::with_label("Open Local Project");
     open_local.add_css_class(&button_css_class("primary"));
-    open_local.add_css_class("sim-rns-launcher-action");
-    open_local.add_css_class("sim-rns-launcher-action-primary");
 
     let open_remote = Button::with_label("Open Remote Project");
     open_remote.add_css_class(&button_css_class("secondary"));
-    open_remote.add_css_class("sim-rns-launcher-action");
-    open_remote.add_css_class("sim-rns-launcher-action-secondary");
     open_remote.set_sensitive(false);
 
     let create_project_button = Button::with_label("Create New Project");
     create_project_button.add_css_class(&button_css_class("secondary"));
-    create_project_button.add_css_class("sim-rns-launcher-action");
-    create_project_button.add_css_class("sim-rns-launcher-action-secondary");
 
     actions_box.append(&open_local);
     actions_box.append(&open_remote);
