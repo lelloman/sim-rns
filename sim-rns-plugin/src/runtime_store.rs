@@ -30,28 +30,18 @@ impl RuntimeController {
         self.store.refresh(load_snapshot)
     }
 
-    pub(crate) fn vm_state(
-        &self,
-        load_snapshot: impl FnOnce() -> RuntimeViewSnapshot,
-    ) -> Option<RuntimeVmState> {
-        self.latest_or_refresh(load_snapshot).vm_state()
+    pub(crate) fn vm_state(&self) -> Option<RuntimeVmState> {
+        self.store
+            .latest()
+            .as_ref()
+            .and_then(RuntimeViewSnapshot::vm_state)
     }
 
-    pub(crate) fn run_command(
-        &self,
-        command: impl FnOnce() -> Result<(), String>,
-        load_snapshot: impl FnOnce() -> RuntimeViewSnapshot,
-    ) -> Result<(), String> {
-        match command() {
-            Ok(()) => {
-                self.refresh(load_snapshot);
-                Ok(())
-            }
-            Err(error) => {
-                self.publish_error(error.clone(), load_snapshot);
-                Err(error)
-            }
-        }
+    pub(crate) fn is_busy(&self) -> bool {
+        self.store
+            .latest()
+            .as_ref()
+            .is_some_and(RuntimeViewSnapshot::is_busy)
     }
 
     pub(crate) fn publish_error(
@@ -61,6 +51,30 @@ impl RuntimeController {
     ) {
         let snapshot = self.latest_or_refresh(load_snapshot).with_error(error);
         self.store.publish(snapshot);
+    }
+
+    pub(crate) fn begin_operation(&self, operation: RuntimeOperation) {
+        let snapshot = self
+            .store
+            .latest()
+            .unwrap_or_else(RuntimeViewSnapshot::empty)
+            .with_operation(operation);
+        self.store.publish(snapshot);
+    }
+
+    pub(crate) fn complete_operation(&self, result: Result<RuntimeViewSnapshot, String>) {
+        match result {
+            Ok(snapshot) => self.store.publish(snapshot.without_operation()),
+            Err(error) => {
+                let snapshot = self
+                    .store
+                    .latest()
+                    .unwrap_or_else(RuntimeViewSnapshot::empty)
+                    .without_operation()
+                    .with_error(error);
+                self.store.publish(snapshot);
+            }
+        }
     }
 }
 
@@ -109,6 +123,10 @@ impl RuntimeStore {
         let snapshot = load_snapshot();
         self.publish(snapshot.clone());
         snapshot
+    }
+
+    fn latest(&self) -> Option<RuntimeViewSnapshot> {
+        self.inner.snapshot.borrow().clone()
     }
 
     fn publish(&self, snapshot: RuntimeViewSnapshot) {
@@ -163,7 +181,15 @@ pub(crate) struct RuntimeViewSnapshot {
     pub(crate) project: Option<Project>,
     pub(crate) recipe: Option<Recipe>,
     pub(crate) status: Option<RuntimeStatus>,
+    pub(crate) operation: Option<RuntimeOperation>,
     pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeOperation {
+    Starting,
+    Pausing,
+    Stopping,
 }
 
 impl RuntimeViewSnapshot {
@@ -172,6 +198,7 @@ impl RuntimeViewSnapshot {
             project: Some(project),
             recipe: Some(recipe),
             status: Some(status),
+            operation: None,
             error: None,
         }
     }
@@ -181,6 +208,7 @@ impl RuntimeViewSnapshot {
             project: Some(project),
             recipe: None,
             status: None,
+            operation: None,
             error: Some(error),
         }
     }
@@ -190,7 +218,18 @@ impl RuntimeViewSnapshot {
             project: Some(project),
             recipe: Some(recipe),
             status: None,
+            operation: None,
             error: Some(error),
+        }
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            project: None,
+            recipe: None,
+            status: None,
+            operation: None,
+            error: None,
         }
     }
 
@@ -199,6 +238,7 @@ impl RuntimeViewSnapshot {
             project: None,
             recipe: None,
             status: None,
+            operation: None,
             error: Some(error),
         }
     }
@@ -208,8 +248,23 @@ impl RuntimeViewSnapshot {
         self
     }
 
+    pub(crate) fn with_operation(mut self, operation: RuntimeOperation) -> Self {
+        self.operation = Some(operation);
+        self.error = None;
+        self
+    }
+
+    pub(crate) fn without_operation(mut self) -> Self {
+        self.operation = None;
+        self
+    }
+
     pub(crate) fn vm_state(&self) -> Option<RuntimeVmState> {
         self.status.as_ref().map(|status| status.vm_state.clone())
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.operation.is_some()
     }
 }
 
@@ -319,52 +374,44 @@ mod tests {
     }
 
     #[test]
-    fn controller_refreshes_after_successful_command() {
+    fn controller_begin_operation_marks_snapshot_busy() {
         let controller = RuntimeController::default();
-        let loads = Cell::new(0);
+        controller.refresh(|| snapshot("idle"));
 
-        controller
-            .run_command(
-                || Ok(()),
-                || {
-                    loads.set(loads.get() + 1);
-                    snapshot("fresh")
-                },
-            )
-            .expect("command should succeed");
+        controller.begin_operation(RuntimeOperation::Starting);
 
-        assert_eq!(loads.get(), 1);
-        assert_eq!(
-            controller
-                .latest_or_refresh(|| snapshot("stale"))
-                .error
-                .as_deref(),
-            Some("fresh")
-        );
+        let current = controller.latest_or_refresh(|| snapshot("unused"));
+        assert_eq!(current.operation, Some(RuntimeOperation::Starting));
+        assert!(current.error.is_none());
     }
 
     #[test]
-    fn controller_publishes_error_without_discarding_previous_snapshot() {
+    fn controller_complete_operation_publishes_success_snapshot() {
         let controller = RuntimeController::default();
-        let loads = Cell::new(0);
-        controller.refresh(|| snapshot("previous"));
 
-        let result = controller.run_command(
-            || Err("failed command".to_string()),
-            || {
-                loads.set(loads.get() + 1);
-                snapshot("unused")
-            },
-        );
+        controller.begin_operation(RuntimeOperation::Starting);
+        controller.complete_operation(Ok(snapshot("done")));
 
-        assert_eq!(result, Err("failed command".to_string()));
-        assert_eq!(loads.get(), 0);
         assert_eq!(
             controller
                 .latest_or_refresh(|| snapshot("unused"))
                 .error
                 .as_deref(),
-            Some("failed command")
+            Some("done")
         );
+        assert!(!controller.is_busy());
+    }
+
+    #[test]
+    fn controller_complete_operation_publishes_error_without_loader() {
+        let controller = RuntimeController::default();
+        controller.refresh(|| snapshot("previous"));
+        controller.begin_operation(RuntimeOperation::Starting);
+
+        controller.complete_operation(Err("failed command".to_string()));
+
+        let current = controller.latest_or_refresh(|| snapshot("unused"));
+        assert_eq!(current.error.as_deref(), Some("failed command"));
+        assert!(!current.is_busy());
     }
 }

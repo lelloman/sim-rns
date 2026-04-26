@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use std::thread;
 
 mod runtime_store;
 
@@ -15,12 +16,12 @@ use maruzzella_sdk::{
     SurfaceContributionSpec, Version, ViewFactorySpec,
 };
 use sim_rns_core::{
-    close_project, create_project, current_project, load_project, open_project, project_recipe,
-    Element, LauncherConfig, Project, ProjectHandle, ProjectRuntime, QemuRuntime, Recipe,
-    RuntimeCommand, RuntimeStatus, RuntimeVmState, Template,
+    close_project, create_project, current_project, current_project_handle, load_project,
+    open_project, project_recipe, Element, LauncherConfig, Project, ProjectHandle, ProjectRuntime,
+    QemuRuntime, Recipe, RuntimeCommand, RuntimeStatus, RuntimeVmState, Template,
 };
 
-use runtime_store::{RuntimeController, RuntimeViewSnapshot};
+use runtime_store::{RuntimeController, RuntimeOperation, RuntimeViewSnapshot};
 
 const PLUGIN_ID: &str = "com.lelloman.sim_rns";
 const CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -159,18 +160,25 @@ extern "C" fn exit_app_command(_payload: MzBytes) -> MzStatus {
 }
 
 extern "C" fn run_project_command(_payload: MzBytes) -> MzStatus {
-    runtime_command_status(run_project_runtime)
+    spawn_runtime_command(RuntimeOperation::Starting, run_project_runtime)
 }
 
 extern "C" fn pause_project_command(_payload: MzBytes) -> MzStatus {
-    runtime_command_status(|| execute_runtime_command(RuntimeCommand::Pause))
+    spawn_runtime_command(RuntimeOperation::Pausing, |project| {
+        execute_runtime_command(project, RuntimeCommand::Pause)
+    })
 }
 
 extern "C" fn stop_project_command(_payload: MzBytes) -> MzStatus {
-    runtime_command_status(|| execute_runtime_command(RuntimeCommand::Shutdown))
+    spawn_runtime_command(RuntimeOperation::Stopping, |project| {
+        execute_runtime_command(project, RuntimeCommand::Shutdown)
+    })
 }
 
 extern "C" fn can_run_project_command() -> bool {
+    if runtime_command_is_busy() {
+        return false;
+    }
     matches!(
         current_runtime_vm_state(),
         Some(RuntimeVmState::Stopped | RuntimeVmState::Paused)
@@ -178,30 +186,58 @@ extern "C" fn can_run_project_command() -> bool {
 }
 
 extern "C" fn can_pause_project_command() -> bool {
+    if runtime_command_is_busy() {
+        return false;
+    }
     matches!(current_runtime_vm_state(), Some(RuntimeVmState::Running))
 }
 
 extern "C" fn can_stop_project_command() -> bool {
+    if runtime_command_is_busy() {
+        return false;
+    }
     matches!(
         current_runtime_vm_state(),
         Some(RuntimeVmState::Running | RuntimeVmState::Paused)
     )
 }
 
-fn runtime_command_status(command: impl FnOnce() -> Result<(), String>) -> MzStatus {
-    match RUNTIME_CONTROLLER
-        .with(|controller| controller.run_command(command, load_runtime_snapshot))
-    {
-        Ok(()) => MzStatus::OK,
-        Err(error) => {
-            eprintln!("sim-rns: runtime command failed: {error}");
-            MzStatus::new(MzStatusCode::InternalError)
-        }
+fn spawn_runtime_command(
+    operation: RuntimeOperation,
+    command: impl FnOnce(Project) -> Result<(), String> + Send + 'static,
+) -> MzStatus {
+    let Some(handle) = current_project_handle() else {
+        publish_runtime_error("no active project is selected".to_string());
+        return MzStatus::new(MzStatusCode::InvalidArgument);
+    };
+    if runtime_command_is_busy() {
+        return MzStatus::new(MzStatusCode::InvalidArgument);
     }
+    RUNTIME_CONTROLLER.with(|controller| controller.begin_operation(operation));
+
+    let completion_handle = handle.clone();
+    thread::spawn(move || {
+        let result = run_runtime_command_for_handle(handle, command);
+        gtk::glib::MainContext::default().invoke(move || {
+            if current_project_handle().as_ref() != Some(&completion_handle) {
+                return;
+            }
+            if let Err(error) = &result {
+                eprintln!("sim-rns: runtime command failed: {error}");
+            }
+            RUNTIME_CONTROLLER.with(|controller| controller.complete_operation(result));
+        });
+    });
+
+    MzStatus::OK
 }
 
 fn current_runtime_vm_state() -> Option<RuntimeVmState> {
-    RUNTIME_CONTROLLER.with(|controller| controller.vm_state(load_runtime_snapshot))
+    RUNTIME_CONTROLLER.with(|controller| controller.vm_state())
+}
+
+fn runtime_command_is_busy() -> bool {
+    RUNTIME_CONTROLLER.with(|controller| controller.is_busy())
 }
 
 fn refresh_runtime_store() {
@@ -232,6 +268,23 @@ fn load_runtime_snapshot() -> RuntimeViewSnapshot {
         }
     };
     RuntimeViewSnapshot::loaded(project, recipe, status)
+}
+
+fn load_runtime_snapshot_for_project(project: Project) -> Result<RuntimeViewSnapshot, String> {
+    let recipe = project_recipe(&project)?;
+    let status = QemuRuntime::default()
+        .status(&project)
+        .map_err(|error| error.to_string())?;
+    Ok(RuntimeViewSnapshot::loaded(project, recipe, status))
+}
+
+fn run_runtime_command_for_handle(
+    handle: ProjectHandle,
+    command: impl FnOnce(Project) -> Result<(), String>,
+) -> Result<RuntimeViewSnapshot, String> {
+    let project = load_project(handle.path)?;
+    command(project.clone())?;
+    load_runtime_snapshot_for_project(project)
 }
 
 fn build_root(title: &str, subtitle: &str) -> GtkBox {
@@ -638,6 +691,12 @@ fn populate_overview_from_snapshot(
     if let Some(project) = &snapshot.project {
         list.append(&section_card("Project", &build_project_summary(project)));
     }
+    if let Some(operation) = &snapshot.operation {
+        list.append(&section_card(
+            "Runtime Command",
+            &[format!("Current operation = {operation:?}")],
+        ));
+    }
     if let Some(status) = &snapshot.status {
         list.append(&section_card("Runtime", &runtime_summary_lines(status)));
         list.append(&section_card("Runtime Nodes", &runtime_node_lines(status)));
@@ -663,16 +722,14 @@ fn populate_overview_from_snapshot(
     }
 }
 
-fn execute_runtime_command(command: RuntimeCommand) -> Result<(), String> {
-    let project = load_workspace_project()?;
+fn execute_runtime_command(project: Project, command: RuntimeCommand) -> Result<(), String> {
     QemuRuntime::default()
         .execute(&project, command)
         .map_err(|error| error.to_string())?;
     Ok(())
 }
 
-fn run_project_runtime() -> Result<(), String> {
-    let project = load_workspace_project()?;
+fn run_project_runtime(project: Project) -> Result<(), String> {
     let runtime = QemuRuntime::default();
     let status = runtime
         .status(&project)
