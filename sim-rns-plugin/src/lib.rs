@@ -1,3 +1,7 @@
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+use std::rc::Rc;
+
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
@@ -29,6 +33,10 @@ const CMD_EXIT_APP: &str = "sim-rns.app.exit";
 const CMD_RUN_PROJECT: &str = "sim-rns.runtime.run";
 const CMD_PAUSE_PROJECT: &str = "sim-rns.runtime.pause";
 const CMD_STOP_PROJECT: &str = "sim-rns.runtime.stop";
+
+thread_local! {
+    static RUNTIME_STORE: RuntimeStore = RuntimeStore::default();
+}
 
 pub struct SimRnsPlugin;
 
@@ -174,20 +182,152 @@ extern "C" fn can_stop_project_command() -> bool {
 
 fn runtime_command_status(command: impl FnOnce() -> Result<(), String>) -> MzStatus {
     match command() {
-        Ok(()) => MzStatus::OK,
+        Ok(()) => {
+            refresh_runtime_store();
+            MzStatus::OK
+        }
         Err(error) => {
             eprintln!("sim-rns: runtime command failed: {error}");
+            publish_runtime_error(error);
             MzStatus::new(MzStatusCode::InternalError)
         }
     }
 }
 
 fn current_runtime_vm_state() -> Option<RuntimeVmState> {
-    let project = load_workspace_project().ok()?;
-    QemuRuntime::default()
-        .status(&project)
-        .ok()
-        .map(|status| status.vm_state)
+    RUNTIME_STORE.with(|store| store.latest_or_refresh().vm_state())
+}
+
+fn refresh_runtime_store() {
+    RUNTIME_STORE.with(|store| {
+        store.refresh();
+    });
+}
+
+fn publish_runtime_error(error: String) {
+    RUNTIME_STORE.with(|store| {
+        store.publish(RuntimeViewSnapshot::error(error));
+    });
+}
+
+type RuntimeObserver = Rc<dyn Fn(&RuntimeViewSnapshot)>;
+
+#[derive(Default)]
+struct RuntimeStore {
+    next_observer_id: Cell<u64>,
+    snapshot: RefCell<Option<RuntimeViewSnapshot>>,
+    observers: RefCell<BTreeMap<u64, RuntimeObserver>>,
+}
+
+impl RuntimeStore {
+    fn subscribe(&self, observer: RuntimeObserver) -> RuntimeSubscription {
+        let id = self.next_observer_id.get() + 1;
+        self.next_observer_id.set(id);
+        self.observers.borrow_mut().insert(id, observer.clone());
+        if let Some(snapshot) = self.snapshot.borrow().as_ref() {
+            observer(snapshot);
+        }
+        RuntimeSubscription { id }
+    }
+
+    fn unsubscribe(&self, id: u64) {
+        self.observers.borrow_mut().remove(&id);
+    }
+
+    fn latest_or_refresh(&self) -> RuntimeViewSnapshot {
+        if let Some(snapshot) = self.snapshot.borrow().clone() {
+            snapshot
+        } else {
+            self.refresh()
+        }
+    }
+
+    fn refresh(&self) -> RuntimeViewSnapshot {
+        let snapshot = RuntimeViewSnapshot::load();
+        self.publish(snapshot.clone());
+        snapshot
+    }
+
+    fn publish(&self, snapshot: RuntimeViewSnapshot) {
+        self.snapshot.replace(Some(snapshot.clone()));
+        let observers = self
+            .observers
+            .borrow()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for observer in observers {
+            observer(&snapshot);
+        }
+    }
+}
+
+struct RuntimeSubscription {
+    id: u64,
+}
+
+impl Drop for RuntimeSubscription {
+    fn drop(&mut self) {
+        RUNTIME_STORE.with(|store| store.unsubscribe(self.id));
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeViewSnapshot {
+    project: Option<Project>,
+    recipe: Option<Recipe>,
+    status: Option<RuntimeStatus>,
+    error: Option<String>,
+}
+
+impl RuntimeViewSnapshot {
+    fn load() -> Self {
+        let project = match load_workspace_project() {
+            Ok(project) => project,
+            Err(error) => return Self::error(error),
+        };
+        let recipe = match project_recipe(&project) {
+            Ok(recipe) => recipe,
+            Err(error) => {
+                return Self {
+                    project: Some(project),
+                    recipe: None,
+                    status: None,
+                    error: Some(error),
+                };
+            }
+        };
+        let status = match QemuRuntime::default().status(&project) {
+            Ok(status) => status,
+            Err(error) => {
+                return Self {
+                    project: Some(project),
+                    recipe: Some(recipe),
+                    status: None,
+                    error: Some(error.to_string()),
+                };
+            }
+        };
+        Self {
+            project: Some(project),
+            recipe: Some(recipe),
+            status: Some(status),
+            error: None,
+        }
+    }
+
+    fn error(error: String) -> Self {
+        Self {
+            project: None,
+            recipe: None,
+            status: None,
+            error: Some(error),
+        }
+    }
+
+    fn vm_state(&self) -> Option<RuntimeVmState> {
+        self.status.as_ref().map(|status| status.vm_state.clone())
+    }
 }
 
 fn build_root(title: &str, subtitle: &str) -> GtkBox {
@@ -575,36 +715,46 @@ fn runtime_event_lines(status: &RuntimeStatus) -> Vec<String> {
         .collect()
 }
 
-fn populate_overview_list(
+fn populate_overview_from_snapshot(
     list: &ListBox,
-    project: &Project,
-    recipe: &Recipe,
-    status: &RuntimeStatus,
+    error_label: &Label,
+    snapshot: &RuntimeViewSnapshot,
 ) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
 
-    list.append(&section_card("Project", &build_project_summary(project)));
-    list.append(&section_card("Runtime", &runtime_summary_lines(status)));
-    list.append(&section_card("Runtime Nodes", &runtime_node_lines(status)));
-    list.append(&section_card(
-        "Runtime Topology",
-        &runtime_topology_lines(status),
-    ));
-    list.append(&section_card("Snapshots", &runtime_snapshot_lines(status)));
-    list.append(&section_card(
-        "Recent Runtime Events",
-        &runtime_event_lines(status),
-    ));
-    list.append(&section_card("Overview", &overview_lines(recipe)));
-    list.append(&section_card("Startup Order", &recipe.startup.order));
+    if let Some(error) = &snapshot.error {
+        set_error(error_label, error);
+    } else {
+        set_error(error_label, "");
+    }
 
-    for element in &recipe.elements {
+    if let Some(project) = &snapshot.project {
+        list.append(&section_card("Project", &build_project_summary(project)));
+    }
+    if let Some(status) = &snapshot.status {
+        list.append(&section_card("Runtime", &runtime_summary_lines(status)));
+        list.append(&section_card("Runtime Nodes", &runtime_node_lines(status)));
         list.append(&section_card(
-            &format!("Element {}", element.id),
-            &element_lines(element),
+            "Runtime Topology",
+            &runtime_topology_lines(status),
         ));
+        list.append(&section_card("Snapshots", &runtime_snapshot_lines(status)));
+        list.append(&section_card(
+            "Recent Runtime Events",
+            &runtime_event_lines(status),
+        ));
+    }
+    if let Some(recipe) = &snapshot.recipe {
+        list.append(&section_card("Overview", &overview_lines(recipe)));
+        list.append(&section_card("Startup Order", &recipe.startup.order));
+        for element in &recipe.elements {
+            list.append(&section_card(
+                &format!("Element {}", element.id),
+                &element_lines(element),
+            ));
+        }
     }
 }
 
@@ -986,46 +1136,44 @@ extern "C" fn create_overview_view(
         return std::ptr::null_mut();
     }
 
-    let project = match load_workspace_project() {
-        Ok(project) => project,
-        Err(error) => {
-            let root = build_root("Open a project", &error);
-            return unsafe {
-                <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
-                    as *mut std::ffi::c_void
-            };
-        }
+    let snapshot = RUNTIME_STORE.with(|store| store.latest_or_refresh());
+    let title = snapshot
+        .project
+        .as_ref()
+        .map(|project| project.file.name.as_str())
+        .unwrap_or("Open a project");
+    let subtitle = if snapshot.project.is_some() {
+        "The workspace is bound to the selected project root and drives the simulated runtime contract that will later be backed by the VM."
+    } else {
+        snapshot
+            .error
+            .as_deref()
+            .unwrap_or("Select or create a project to inspect the runtime.")
     };
-    let recipe = match project_recipe(&project) {
-        Ok(recipe) => recipe,
-        Err(error) => {
-            let root = build_root("Project failed to load", &error);
-            return unsafe {
-                <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
-                    as *mut std::ffi::c_void
-            };
-        }
-    };
-    let status = match QemuRuntime::default().status(&project) {
-        Ok(status) => status,
-        Err(error) => {
-            let root = build_root("Project runtime failed to load", &error.to_string());
-            return unsafe {
-                <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
-                    as *mut std::ffi::c_void
-            };
-        }
-    };
-    let root = build_root(
-        &project.file.name,
-        "The workspace is bound to the selected project root and drives the simulated runtime contract that will later be backed by the VM.",
-    );
+    let root = build_root(title, subtitle);
     let error_label = workspace_error_label();
     root.append(&error_label);
 
     let list = ListBox::new();
     list.set_selection_mode(SelectionMode::None);
-    populate_overview_list(&list, &project, &recipe, &status);
+    populate_overview_from_snapshot(&list, &error_label, &snapshot);
+
+    let list_for_updates = list.downgrade();
+    let error_label_for_updates = error_label.downgrade();
+    let subscription = RUNTIME_STORE.with(|store| {
+        store.subscribe(Rc::new(move |snapshot| {
+            let Some(list) = list_for_updates.upgrade() else {
+                return;
+            };
+            let Some(error_label) = error_label_for_updates.upgrade() else {
+                return;
+            };
+            populate_overview_from_snapshot(&list, &error_label, snapshot);
+        }))
+    });
+    unsafe {
+        root.set_data("sim-rns-runtime-subscription", subscription);
+    }
 
     let scroller = create_scroller();
     scroller.set_child(Some(&list));
