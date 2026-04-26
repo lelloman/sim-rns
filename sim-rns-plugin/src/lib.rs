@@ -1,6 +1,6 @@
-use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
 use std::rc::Rc;
+
+mod runtime_store;
 
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
@@ -19,6 +19,8 @@ use sim_rns_core::{
     Element, LauncherConfig, Project, ProjectHandle, ProjectRuntime, QemuRuntime, Recipe,
     RuntimeCommand, RuntimeStatus, RuntimeVmState, Template,
 };
+
+use runtime_store::{RuntimeStore, RuntimeViewSnapshot};
 
 const PLUGIN_ID: &str = "com.lelloman.sim_rns";
 const CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -136,8 +138,14 @@ extern "C" fn open_project_launcher_command(_payload: MzBytes) -> MzStatus {
 
 extern "C" fn close_project_command(_payload: MzBytes) -> MzStatus {
     match close_project() {
-        Ok(()) => MzStatus::OK,
-        Err(_) => MzStatus::new(MzStatusCode::InternalError),
+        Ok(()) => {
+            refresh_runtime_store();
+            MzStatus::OK
+        }
+        Err(error) => {
+            publish_runtime_error(error);
+            MzStatus::new(MzStatusCode::InternalError)
+        }
     }
 }
 
@@ -195,139 +203,40 @@ fn runtime_command_status(command: impl FnOnce() -> Result<(), String>) -> MzSta
 }
 
 fn current_runtime_vm_state() -> Option<RuntimeVmState> {
-    RUNTIME_STORE.with(|store| store.latest_or_refresh().vm_state())
+    RUNTIME_STORE.with(|store| store.latest_or_refresh(load_runtime_snapshot).vm_state())
 }
 
 fn refresh_runtime_store() {
     RUNTIME_STORE.with(|store| {
-        store.refresh();
+        store.refresh(load_runtime_snapshot);
     });
 }
 
 fn publish_runtime_error(error: String) {
     RUNTIME_STORE.with(|store| {
-        store.publish(RuntimeViewSnapshot::error(error));
+        let snapshot = store
+            .latest_or_refresh(load_runtime_snapshot)
+            .with_error(error);
+        store.publish(snapshot);
     });
 }
 
-type RuntimeObserver = Rc<dyn Fn(&RuntimeViewSnapshot)>;
-
-#[derive(Default)]
-struct RuntimeStore {
-    next_observer_id: Cell<u64>,
-    snapshot: RefCell<Option<RuntimeViewSnapshot>>,
-    observers: RefCell<BTreeMap<u64, RuntimeObserver>>,
-}
-
-impl RuntimeStore {
-    fn subscribe(&self, observer: RuntimeObserver) -> RuntimeSubscription {
-        let id = self.next_observer_id.get() + 1;
-        self.next_observer_id.set(id);
-        self.observers.borrow_mut().insert(id, observer.clone());
-        if let Some(snapshot) = self.snapshot.borrow().as_ref() {
-            observer(snapshot);
+fn load_runtime_snapshot() -> RuntimeViewSnapshot {
+    let project = match load_workspace_project() {
+        Ok(project) => project,
+        Err(error) => return RuntimeViewSnapshot::error(error),
+    };
+    let recipe = match project_recipe(&project) {
+        Ok(recipe) => recipe,
+        Err(error) => return RuntimeViewSnapshot::project_error(project, error),
+    };
+    let status = match QemuRuntime::default().status(&project) {
+        Ok(status) => status,
+        Err(error) => {
+            return RuntimeViewSnapshot::runtime_error(project, recipe, error.to_string())
         }
-        RuntimeSubscription { id }
-    }
-
-    fn unsubscribe(&self, id: u64) {
-        self.observers.borrow_mut().remove(&id);
-    }
-
-    fn latest_or_refresh(&self) -> RuntimeViewSnapshot {
-        if let Some(snapshot) = self.snapshot.borrow().clone() {
-            snapshot
-        } else {
-            self.refresh()
-        }
-    }
-
-    fn refresh(&self) -> RuntimeViewSnapshot {
-        let snapshot = RuntimeViewSnapshot::load();
-        self.publish(snapshot.clone());
-        snapshot
-    }
-
-    fn publish(&self, snapshot: RuntimeViewSnapshot) {
-        self.snapshot.replace(Some(snapshot.clone()));
-        let observers = self
-            .observers
-            .borrow()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for observer in observers {
-            observer(&snapshot);
-        }
-    }
-}
-
-struct RuntimeSubscription {
-    id: u64,
-}
-
-impl Drop for RuntimeSubscription {
-    fn drop(&mut self) {
-        RUNTIME_STORE.with(|store| store.unsubscribe(self.id));
-    }
-}
-
-#[derive(Clone)]
-struct RuntimeViewSnapshot {
-    project: Option<Project>,
-    recipe: Option<Recipe>,
-    status: Option<RuntimeStatus>,
-    error: Option<String>,
-}
-
-impl RuntimeViewSnapshot {
-    fn load() -> Self {
-        let project = match load_workspace_project() {
-            Ok(project) => project,
-            Err(error) => return Self::error(error),
-        };
-        let recipe = match project_recipe(&project) {
-            Ok(recipe) => recipe,
-            Err(error) => {
-                return Self {
-                    project: Some(project),
-                    recipe: None,
-                    status: None,
-                    error: Some(error),
-                };
-            }
-        };
-        let status = match QemuRuntime::default().status(&project) {
-            Ok(status) => status,
-            Err(error) => {
-                return Self {
-                    project: Some(project),
-                    recipe: Some(recipe),
-                    status: None,
-                    error: Some(error.to_string()),
-                };
-            }
-        };
-        Self {
-            project: Some(project),
-            recipe: Some(recipe),
-            status: Some(status),
-            error: None,
-        }
-    }
-
-    fn error(error: String) -> Self {
-        Self {
-            project: None,
-            recipe: None,
-            status: None,
-            error: Some(error),
-        }
-    }
-
-    fn vm_state(&self) -> Option<RuntimeVmState> {
-        self.status.as_ref().map(|status| status.vm_state.clone())
-    }
+    };
+    RuntimeViewSnapshot::loaded(project, recipe, status)
 }
 
 fn build_root(title: &str, subtitle: &str) -> GtkBox {
@@ -623,6 +532,7 @@ fn open_selected_project(
         maruzzella_sdk::ffi::MzLogLevel::Info,
         "sim-rns: project opened successfully",
     );
+    refresh_runtime_store();
     Ok(())
 }
 
@@ -1136,7 +1046,7 @@ extern "C" fn create_overview_view(
         return std::ptr::null_mut();
     }
 
-    let snapshot = RUNTIME_STORE.with(|store| store.latest_or_refresh());
+    let snapshot = RUNTIME_STORE.with(|store| store.latest_or_refresh(load_runtime_snapshot));
     let title = snapshot
         .project
         .as_ref()
