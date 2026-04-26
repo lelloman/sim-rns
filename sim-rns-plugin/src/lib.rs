@@ -11,9 +11,9 @@ use maruzzella_sdk::{
     SurfaceContributionSpec, Version, ViewFactorySpec,
 };
 use sim_rns_core::{
-    add_node_include, add_script_include, close_project, create_project, current_project,
-    load_project, open_project, project_recipe, Element, LauncherConfig, NodeRuntimeState, Project,
-    ProjectHandle, ProjectRuntime, QemuRuntime, Recipe, RuntimeCommand, RuntimeStatus, Template,
+    close_project, create_project, current_project, load_project, open_project, project_recipe,
+    Element, LauncherConfig, Project, ProjectHandle, ProjectRuntime, QemuRuntime, Recipe,
+    RuntimeCommand, RuntimeStatus, RuntimeVmState, Template,
 };
 
 const PLUGIN_ID: &str = "com.lelloman.sim_rns";
@@ -26,6 +26,9 @@ const CMD_NEW_PROJECT: &str = "sim-rns.project.new";
 const CMD_OPEN_PROJECT: &str = "sim-rns.project.open";
 const CMD_CLOSE_PROJECT: &str = "sim-rns.project.close";
 const CMD_EXIT_APP: &str = "sim-rns.app.exit";
+const CMD_RUN_PROJECT: &str = "sim-rns.runtime.run";
+const CMD_PAUSE_PROJECT: &str = "sim-rns.runtime.pause";
+const CMD_STOP_PROJECT: &str = "sim-rns.runtime.stop";
 
 pub struct SimRnsPlugin;
 
@@ -69,6 +72,21 @@ impl Plugin for SimRnsPlugin {
         )?;
         host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_EXIT_APP, "Exit").with_handler(exit_app_command),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_RUN_PROJECT, "Run")
+                .with_handler(run_project_command)
+                .with_enabled(can_run_project_command),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_PAUSE_PROJECT, "Pause")
+                .with_handler(pause_project_command)
+                .with_enabled(can_pause_project_command),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_STOP_PROJECT, "Stop")
+                .with_handler(stop_project_command)
+                .with_enabled(can_stop_project_command),
         )?;
 
         host.register_view_factory(ViewFactorySpec::new(
@@ -122,6 +140,54 @@ extern "C" fn exit_app_command(_payload: MzBytes) -> MzStatus {
         std::process::exit(0);
     }
     MzStatus::OK
+}
+
+extern "C" fn run_project_command(_payload: MzBytes) -> MzStatus {
+    runtime_command_status(run_project_runtime)
+}
+
+extern "C" fn pause_project_command(_payload: MzBytes) -> MzStatus {
+    runtime_command_status(|| execute_runtime_command(RuntimeCommand::Pause))
+}
+
+extern "C" fn stop_project_command(_payload: MzBytes) -> MzStatus {
+    runtime_command_status(|| execute_runtime_command(RuntimeCommand::Shutdown))
+}
+
+extern "C" fn can_run_project_command() -> bool {
+    matches!(
+        current_runtime_vm_state(),
+        Some(RuntimeVmState::Stopped | RuntimeVmState::Paused)
+    )
+}
+
+extern "C" fn can_pause_project_command() -> bool {
+    matches!(current_runtime_vm_state(), Some(RuntimeVmState::Running))
+}
+
+extern "C" fn can_stop_project_command() -> bool {
+    matches!(
+        current_runtime_vm_state(),
+        Some(RuntimeVmState::Running | RuntimeVmState::Paused)
+    )
+}
+
+fn runtime_command_status(command: impl FnOnce() -> Result<(), String>) -> MzStatus {
+    match command() {
+        Ok(()) => MzStatus::OK,
+        Err(error) => {
+            eprintln!("sim-rns: runtime command failed: {error}");
+            MzStatus::new(MzStatusCode::InternalError)
+        }
+    }
+}
+
+fn current_runtime_vm_state() -> Option<RuntimeVmState> {
+    let project = load_workspace_project().ok()?;
+    QemuRuntime::default()
+        .status(&project)
+        .ok()
+        .map(|status| status.vm_state)
 }
 
 fn build_root(title: &str, subtitle: &str) -> GtkBox {
@@ -542,71 +608,40 @@ fn populate_overview_list(
     }
 }
 
-fn reload_overview(list: &ListBox, error_label: &Label) {
-    match load_workspace_project().and_then(|project| {
-        let recipe = project_recipe(&project)?;
-        let status = QemuRuntime::default()
-            .status(&project)
-            .map_err(|error| error.to_string())?;
-        Ok((project, recipe, status))
-    }) {
-        Ok((project, recipe, status)) => {
-            populate_overview_list(list, &project, &recipe, &status);
-            set_error(error_label, "");
-        }
-        Err(error) => set_error(error_label, &error),
-    }
-}
-
-fn execute_runtime_command(
-    list: &ListBox,
-    error_label: &Label,
-    command: RuntimeCommand,
-) -> Result<(), String> {
+fn execute_runtime_command(command: RuntimeCommand) -> Result<(), String> {
     let project = load_workspace_project()?;
     QemuRuntime::default()
         .execute(&project, command)
         .map_err(|error| error.to_string())?;
-    reload_overview(list, error_label);
     Ok(())
 }
 
-fn execute_runtime_command_for_all_nodes(
-    list: &ListBox,
-    error_label: &Label,
-    command_for_node: impl Fn(String) -> RuntimeCommand,
-) -> Result<(), String> {
+fn run_project_runtime() -> Result<(), String> {
     let project = load_workspace_project()?;
-    let status = QemuRuntime::default()
+    let runtime = QemuRuntime::default();
+    let status = runtime
         .status(&project)
         .map_err(|error| error.to_string())?;
-    for node in status
-        .nodes
-        .into_iter()
-        .filter(|node| node.enabled && node.state != NodeRuntimeState::Disabled)
-    {
-        QemuRuntime::default()
-            .execute(&project, command_for_node(node.element_id))
+    if status.vm_state == RuntimeVmState::Paused {
+        runtime
+            .execute(&project, RuntimeCommand::Resume)
+            .map_err(|error| error.to_string())?;
+    } else {
+        if !status.vm_assets.prepared {
+            runtime
+                .execute(
+                    &project,
+                    RuntimeCommand::PrepareVm {
+                        source_image: None,
+                        size_gb: 8,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        runtime
+            .execute(&project, RuntimeCommand::Boot)
             .map_err(|error| error.to_string())?;
     }
-    reload_overview(list, error_label);
-    Ok(())
-}
-
-fn restore_latest_snapshot(list: &ListBox, error_label: &Label) -> Result<(), String> {
-    let project = load_workspace_project()?;
-    let status = QemuRuntime::default()
-        .status(&project)
-        .map_err(|error| error.to_string())?;
-    let snapshot_id = status
-        .snapshots
-        .first()
-        .map(|snapshot| snapshot.id.clone())
-        .ok_or_else(|| "no snapshots are available to restore".to_string())?;
-    QemuRuntime::default()
-        .execute(&project, RuntimeCommand::RestoreSnapshot { snapshot_id })
-        .map_err(|error| error.to_string())?;
-    reload_overview(list, error_label);
     Ok(())
 }
 
@@ -985,39 +1020,6 @@ extern "C" fn create_overview_view(
         &project.file.name,
         "The workspace is bound to the selected project root and drives the simulated runtime contract that will later be backed by the VM.",
     );
-    let action_area = GtkBox::new(Orientation::Vertical, 8);
-    let runtime_action_bar = GtkBox::new(Orientation::Horizontal, 8);
-    let project_action_bar = GtkBox::new(Orientation::Horizontal, 8);
-    let close_project_button = Button::with_label("Close Project");
-    let prepare_vm_button = Button::with_label("Prepare VM");
-    let boot_button = Button::with_label("Boot");
-    let pause_button = Button::with_label("Pause");
-    let resume_button = Button::with_label("Resume");
-    let shutdown_button = Button::with_label("Shutdown");
-    let snapshot_button = Button::with_label("Snapshot");
-    let restore_button = Button::with_label("Restore Latest");
-    let start_nodes_button = Button::with_label("Start Nodes");
-    let stop_nodes_button = Button::with_label("Stop Nodes");
-    let restart_nodes_button = Button::with_label("Restart Nodes");
-    let add_script_button = Button::with_label("Add Script");
-    let add_node_button = Button::with_label("Add Node");
-    runtime_action_bar.append(&prepare_vm_button);
-    runtime_action_bar.append(&boot_button);
-    runtime_action_bar.append(&pause_button);
-    runtime_action_bar.append(&resume_button);
-    runtime_action_bar.append(&shutdown_button);
-    runtime_action_bar.append(&snapshot_button);
-    runtime_action_bar.append(&restore_button);
-    runtime_action_bar.append(&start_nodes_button);
-    runtime_action_bar.append(&stop_nodes_button);
-    runtime_action_bar.append(&restart_nodes_button);
-    project_action_bar.append(&close_project_button);
-    project_action_bar.append(&add_script_button);
-    project_action_bar.append(&add_node_button);
-    action_area.append(&runtime_action_bar);
-    action_area.append(&project_action_bar);
-    root.append(&action_area);
-
     let error_label = workspace_error_label();
     root.append(&error_label);
 
@@ -1028,176 +1030,6 @@ extern "C" fn create_overview_view(
     let scroller = create_scroller();
     scroller.set_child(Some(&list));
     root.append(&scroller);
-
-    let error_label_for_close = error_label.clone();
-    close_project_button.connect_clicked(move |_| match close_project() {
-        Ok(()) => set_error(&error_label_for_close, ""),
-        Err(error) => set_error(&error_label_for_close, &error),
-    });
-
-    let list_for_prepare_vm = list.clone();
-    let error_label_for_prepare_vm = error_label.clone();
-    prepare_vm_button.connect_clicked(move |_| {
-        match execute_runtime_command(
-            &list_for_prepare_vm,
-            &error_label_for_prepare_vm,
-            RuntimeCommand::PrepareVm {
-                source_image: None,
-                size_gb: 8,
-            },
-        ) {
-            Ok(()) => set_error(&error_label_for_prepare_vm, ""),
-            Err(error) => set_error(&error_label_for_prepare_vm, &error),
-        }
-    });
-
-    let list_for_boot = list.clone();
-    let error_label_for_boot = error_label.clone();
-    boot_button.connect_clicked(move |_| {
-        match execute_runtime_command(&list_for_boot, &error_label_for_boot, RuntimeCommand::Boot) {
-            Ok(()) => set_error(&error_label_for_boot, ""),
-            Err(error) => set_error(&error_label_for_boot, &error),
-        }
-    });
-
-    let list_for_pause = list.clone();
-    let error_label_for_pause = error_label.clone();
-    pause_button.connect_clicked(move |_| {
-        match execute_runtime_command(
-            &list_for_pause,
-            &error_label_for_pause,
-            RuntimeCommand::Pause,
-        ) {
-            Ok(()) => set_error(&error_label_for_pause, ""),
-            Err(error) => set_error(&error_label_for_pause, &error),
-        }
-    });
-
-    let list_for_resume = list.clone();
-    let error_label_for_resume = error_label.clone();
-    resume_button.connect_clicked(move |_| {
-        match execute_runtime_command(
-            &list_for_resume,
-            &error_label_for_resume,
-            RuntimeCommand::Resume,
-        ) {
-            Ok(()) => set_error(&error_label_for_resume, ""),
-            Err(error) => set_error(&error_label_for_resume, &error),
-        }
-    });
-
-    let list_for_shutdown = list.clone();
-    let error_label_for_shutdown = error_label.clone();
-    shutdown_button.connect_clicked(move |_| {
-        match execute_runtime_command(
-            &list_for_shutdown,
-            &error_label_for_shutdown,
-            RuntimeCommand::Shutdown,
-        ) {
-            Ok(()) => set_error(&error_label_for_shutdown, ""),
-            Err(error) => set_error(&error_label_for_shutdown, &error),
-        }
-    });
-
-    let list_for_snapshot = list.clone();
-    let error_label_for_snapshot = error_label.clone();
-    snapshot_button.connect_clicked(move |_| {
-        match execute_runtime_command(
-            &list_for_snapshot,
-            &error_label_for_snapshot,
-            RuntimeCommand::CreateSnapshot {
-                name: "Manual Snapshot".to_string(),
-                note: Some("Created from the workspace scaffold.".to_string()),
-            },
-        ) {
-            Ok(()) => set_error(&error_label_for_snapshot, ""),
-            Err(error) => set_error(&error_label_for_snapshot, &error),
-        }
-    });
-
-    let list_for_restore = list.clone();
-    let error_label_for_restore = error_label.clone();
-    restore_button.connect_clicked(move |_| {
-        match restore_latest_snapshot(&list_for_restore, &error_label_for_restore) {
-            Ok(()) => set_error(&error_label_for_restore, ""),
-            Err(error) => set_error(&error_label_for_restore, &error),
-        }
-    });
-
-    let list_for_start_nodes = list.clone();
-    let error_label_for_start_nodes = error_label.clone();
-    start_nodes_button.connect_clicked(move |_| {
-        match execute_runtime_command_for_all_nodes(
-            &list_for_start_nodes,
-            &error_label_for_start_nodes,
-            |element_id| RuntimeCommand::StartNode { element_id },
-        ) {
-            Ok(()) => set_error(&error_label_for_start_nodes, ""),
-            Err(error) => set_error(&error_label_for_start_nodes, &error),
-        }
-    });
-
-    let list_for_stop_nodes = list.clone();
-    let error_label_for_stop_nodes = error_label.clone();
-    stop_nodes_button.connect_clicked(move |_| {
-        match execute_runtime_command_for_all_nodes(
-            &list_for_stop_nodes,
-            &error_label_for_stop_nodes,
-            |element_id| RuntimeCommand::StopNode { element_id },
-        ) {
-            Ok(()) => set_error(&error_label_for_stop_nodes, ""),
-            Err(error) => set_error(&error_label_for_stop_nodes, &error),
-        }
-    });
-
-    let list_for_restart_nodes = list.clone();
-    let error_label_for_restart_nodes = error_label.clone();
-    restart_nodes_button.connect_clicked(move |_| {
-        match execute_runtime_command_for_all_nodes(
-            &list_for_restart_nodes,
-            &error_label_for_restart_nodes,
-            |element_id| RuntimeCommand::RestartNode { element_id },
-        ) {
-            Ok(()) => set_error(&error_label_for_restart_nodes, ""),
-            Err(error) => set_error(&error_label_for_restart_nodes, &error),
-        }
-    });
-
-    let list_for_script = list.clone();
-    let error_label_for_script = error_label.clone();
-    add_script_button.connect_clicked(move |_| {
-        match load_workspace_project().and_then(|project| {
-            let (_updated, relative_path) = add_script_include(&project.root_path)?;
-            Ok(relative_path)
-        }) {
-            Ok(relative_path) => {
-                reload_overview(&list_for_script, &error_label_for_script);
-                set_error(
-                    &error_label_for_script,
-                    &format!("Added script include `{relative_path}`."),
-                );
-            }
-            Err(error) => set_error(&error_label_for_script, &error),
-        }
-    });
-
-    let list_for_node = list.clone();
-    let error_label_for_node = error_label.clone();
-    add_node_button.connect_clicked(move |_| {
-        match load_workspace_project().and_then(|project| {
-            let (_updated, relative_path) = add_node_include(&project.root_path)?;
-            Ok(relative_path)
-        }) {
-            Ok(relative_path) => {
-                reload_overview(&list_for_node, &error_label_for_node);
-                set_error(
-                    &error_label_for_node,
-                    &format!("Added node include `{relative_path}`."),
-                );
-            }
-            Err(error) => set_error(&error_label_for_node, &error),
-        }
-    });
 
     unsafe {
         <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())

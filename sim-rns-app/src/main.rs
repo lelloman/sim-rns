@@ -1,8 +1,9 @@
 use gtk::prelude::ApplicationExtManual;
 use maruzzella::{
     build_application_with_handle, default_product_spec, load_static_plugin, plugin_tab,
-    LauncherSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, ShellMode, TabGroupSpec,
-    WindowPolicy, WorkbenchNodeSpec, WorkspaceSession,
+    LauncherSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, ShellChrome, ShellMode,
+    TabGroupSpec, ToolbarDisplayMode, ToolbarItemSpec, WindowPolicy, WorkbenchNodeSpec,
+    WorkspaceSession,
 };
 use serde::{Deserialize, Serialize};
 use sim_rns_core::{
@@ -31,12 +32,12 @@ fn main() {
     let restored_project = load_saved_project_session();
     let mut product = default_product_spec();
     product.branding.title = "Sim RNS".to_string();
-    product.branding.search_placeholder = "Search simulator views".to_string();
     product.branding.status_text =
         "Selected local project loaded into the simulator scaffold".to_string();
-    product.include_base_toolbar_items = true;
+    product.include_base_toolbar_items = false;
     product.menu_roots = root_menu_roots();
     product.menu_items = root_menu_items();
+    product.toolbar_items = runtime_toolbar_items();
 
     product.layout.workbench = WorkbenchNodeSpec::Group(TabGroupSpec::new(
         "workbench-main",
@@ -94,6 +95,11 @@ fn main() {
             ShellMode::Launcher
         })
         .with_launcher(launcher)
+        .with_workspace_chrome(ShellChrome {
+            show_menu_bar: true,
+            show_toolbar: true,
+            show_search: false,
+        })
         .with_launcher_window_policy(WindowPolicy::new(980, 720))
         .with_product(product)
         .with_builtin_plugin(embedded_sim_rns_plugin);
@@ -120,6 +126,7 @@ fn main() {
                 project_handle: Some(project_handle_bytes),
                 shell_spec: Some(workspace_product.shell_spec()),
                 window_policy: None,
+                chrome: None,
             })
             .map_err(|error| error.to_string());
         if result.is_ok() {
@@ -202,6 +209,51 @@ fn root_menu_items() -> Vec<MenuItemSpec> {
         menu_item("browse-views", "view", "Browse Views", "shell.browse_views"),
         menu_item("about", "help", "About", "shell.about"),
     ]
+}
+
+fn runtime_toolbar_items() -> Vec<ToolbarItemSpec> {
+    vec![
+        toolbar_item(
+            "sim-rns.runtime.run",
+            "media-playback-start-symbolic",
+            "Run",
+            "sim-rns.runtime.run",
+            "success",
+        ),
+        toolbar_item(
+            "sim-rns.runtime.pause",
+            "media-playback-pause-symbolic",
+            "Pause",
+            "sim-rns.runtime.pause",
+            "secondary",
+        ),
+        toolbar_item(
+            "sim-rns.runtime.stop",
+            "media-playback-stop-symbolic",
+            "Stop",
+            "sim-rns.runtime.stop",
+            "danger",
+        ),
+    ]
+}
+
+fn toolbar_item(
+    id: &str,
+    icon_name: &str,
+    label: &str,
+    command_id: &str,
+    appearance_id: &str,
+) -> ToolbarItemSpec {
+    ToolbarItemSpec {
+        id: id.to_string(),
+        icon_name: Some(icon_name.to_string()),
+        label: Some(label.to_string()),
+        command_id: command_id.to_string(),
+        payload: Vec::new(),
+        secondary: false,
+        display_mode: ToolbarDisplayMode::IconOnly,
+        appearance_id: appearance_id.to_string(),
+    }
 }
 
 fn menu_item(id: &str, root_id: &str, label: &str, command_id: &str) -> MenuItemSpec {
