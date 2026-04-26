@@ -1,9 +1,8 @@
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
-    gio, Align, Box as GtkBox, Button, FileChooserAction, FileChooserDialog, Frame, GestureClick,
-    Label, ListBox, ListBoxRow, Orientation, Picture, PolicyType, ResponseType, ScrolledWindow,
-    SelectionMode, Separator,
+    gio, Align, Box as GtkBox, Button, FileDialog, Frame, GestureClick, Label, ListBox, ListBoxRow,
+    Orientation, Picture, PolicyType, ScrolledWindow, SelectionMode, Separator,
 };
 use maruzzella_sdk::ffi::{MzBytes, MzStatus};
 use maruzzella_sdk::{
@@ -314,34 +313,23 @@ fn prompt_directory_picker(
     on_selected: impl Fn(std::path::PathBuf) + 'static,
 ) {
     let on_selected = std::rc::Rc::new(on_selected) as std::rc::Rc<dyn Fn(std::path::PathBuf)>;
-    let dialog = FileChooserDialog::new(
-        Some(title),
-        parent,
-        FileChooserAction::SelectFolder,
-        &[
-            ("Cancel", ResponseType::Cancel),
-            (confirm_label, ResponseType::Accept),
-        ],
-    );
-    dialog.add_css_class("app-dialog");
-    dialog.set_modal(true);
+    let mut builder = FileDialog::builder()
+        .title(title)
+        .accept_label(confirm_label)
+        .modal(true);
     if initial_path.is_dir() {
-        let initial_folder = gio::File::for_path(initial_path);
-        let _ = dialog.set_current_folder(Some(&initial_folder));
+        builder = builder.initial_folder(&gio::File::for_path(initial_path));
     }
-    dialog.connect_response(move |dialog, response| {
-        let selected_path = if response == ResponseType::Accept {
-            dialog.file().and_then(|file| file.path())
-        } else {
-            None
-        };
-        dialog.close();
-        if let Some(path) = selected_path {
+    let dialog = builder.build();
+    dialog.select_folder(parent, gio::Cancellable::NONE, move |result| {
+        if let Ok(file) = result {
+            let Some(path) = file.path() else {
+                return;
+            };
             let on_selected = on_selected.clone();
             gtk::glib::idle_add_local_once(move || on_selected(path));
         }
     });
-    dialog.show();
 }
 
 fn set_error(label: &Label, message: &str) {
