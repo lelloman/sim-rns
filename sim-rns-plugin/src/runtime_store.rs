@@ -7,7 +7,65 @@ use sim_rns_core::{Project, Recipe, RuntimeStatus, RuntimeVmState};
 type RuntimeObserver = Rc<dyn Fn(&RuntimeViewSnapshot)>;
 
 #[derive(Clone, Default)]
-pub(crate) struct RuntimeStore {
+pub(crate) struct RuntimeController {
+    store: RuntimeStore,
+}
+
+impl RuntimeController {
+    pub(crate) fn subscribe(&self, observer: RuntimeObserver) -> RuntimeSubscription {
+        self.store.subscribe(observer)
+    }
+
+    pub(crate) fn latest_or_refresh(
+        &self,
+        load_snapshot: impl FnOnce() -> RuntimeViewSnapshot,
+    ) -> RuntimeViewSnapshot {
+        self.store.latest_or_refresh(load_snapshot)
+    }
+
+    pub(crate) fn refresh(
+        &self,
+        load_snapshot: impl FnOnce() -> RuntimeViewSnapshot,
+    ) -> RuntimeViewSnapshot {
+        self.store.refresh(load_snapshot)
+    }
+
+    pub(crate) fn vm_state(
+        &self,
+        load_snapshot: impl FnOnce() -> RuntimeViewSnapshot,
+    ) -> Option<RuntimeVmState> {
+        self.latest_or_refresh(load_snapshot).vm_state()
+    }
+
+    pub(crate) fn run_command(
+        &self,
+        command: impl FnOnce() -> Result<(), String>,
+        load_snapshot: impl FnOnce() -> RuntimeViewSnapshot,
+    ) -> Result<(), String> {
+        match command() {
+            Ok(()) => {
+                self.refresh(load_snapshot);
+                Ok(())
+            }
+            Err(error) => {
+                self.publish_error(error.clone(), load_snapshot);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn publish_error(
+        &self,
+        error: String,
+        load_snapshot: impl FnOnce() -> RuntimeViewSnapshot,
+    ) {
+        let snapshot = self.latest_or_refresh(load_snapshot).with_error(error);
+        self.store.publish(snapshot);
+    }
+}
+
+#[derive(Clone, Default)]
+struct RuntimeStore {
     inner: Rc<RuntimeStoreInner>,
 }
 
@@ -19,7 +77,7 @@ struct RuntimeStoreInner {
 }
 
 impl RuntimeStore {
-    pub(crate) fn subscribe(&self, observer: RuntimeObserver) -> RuntimeSubscription {
+    fn subscribe(&self, observer: RuntimeObserver) -> RuntimeSubscription {
         let id = self.inner.next_observer_id.get() + 1;
         self.inner.next_observer_id.set(id);
         self.inner
@@ -35,7 +93,7 @@ impl RuntimeStore {
         }
     }
 
-    pub(crate) fn latest_or_refresh(
+    fn latest_or_refresh(
         &self,
         load_snapshot: impl FnOnce() -> RuntimeViewSnapshot,
     ) -> RuntimeViewSnapshot {
@@ -47,16 +105,13 @@ impl RuntimeStore {
         }
     }
 
-    pub(crate) fn refresh(
-        &self,
-        load_snapshot: impl FnOnce() -> RuntimeViewSnapshot,
-    ) -> RuntimeViewSnapshot {
+    fn refresh(&self, load_snapshot: impl FnOnce() -> RuntimeViewSnapshot) -> RuntimeViewSnapshot {
         let snapshot = load_snapshot();
         self.publish(snapshot.clone());
         snapshot
     }
 
-    pub(crate) fn publish(&self, snapshot: RuntimeViewSnapshot) {
+    fn publish(&self, snapshot: RuntimeViewSnapshot) {
         let unchanged = self
             .inner
             .snapshot
@@ -261,5 +316,55 @@ mod tests {
         assert_eq!(loads.get(), 1);
         assert_eq!(first, snapshot("loaded"));
         assert_eq!(second, snapshot("loaded"));
+    }
+
+    #[test]
+    fn controller_refreshes_after_successful_command() {
+        let controller = RuntimeController::default();
+        let loads = Cell::new(0);
+
+        controller
+            .run_command(
+                || Ok(()),
+                || {
+                    loads.set(loads.get() + 1);
+                    snapshot("fresh")
+                },
+            )
+            .expect("command should succeed");
+
+        assert_eq!(loads.get(), 1);
+        assert_eq!(
+            controller
+                .latest_or_refresh(|| snapshot("stale"))
+                .error
+                .as_deref(),
+            Some("fresh")
+        );
+    }
+
+    #[test]
+    fn controller_publishes_error_without_discarding_previous_snapshot() {
+        let controller = RuntimeController::default();
+        let loads = Cell::new(0);
+        controller.refresh(|| snapshot("previous"));
+
+        let result = controller.run_command(
+            || Err("failed command".to_string()),
+            || {
+                loads.set(loads.get() + 1);
+                snapshot("unused")
+            },
+        );
+
+        assert_eq!(result, Err("failed command".to_string()));
+        assert_eq!(loads.get(), 0);
+        assert_eq!(
+            controller
+                .latest_or_refresh(|| snapshot("unused"))
+                .error
+                .as_deref(),
+            Some("failed command")
+        );
     }
 }

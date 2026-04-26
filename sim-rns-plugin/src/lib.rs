@@ -20,7 +20,7 @@ use sim_rns_core::{
     RuntimeCommand, RuntimeStatus, RuntimeVmState, Template,
 };
 
-use runtime_store::{RuntimeStore, RuntimeViewSnapshot};
+use runtime_store::{RuntimeController, RuntimeViewSnapshot};
 
 const PLUGIN_ID: &str = "com.lelloman.sim_rns";
 const CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -37,7 +37,7 @@ const CMD_PAUSE_PROJECT: &str = "sim-rns.runtime.pause";
 const CMD_STOP_PROJECT: &str = "sim-rns.runtime.stop";
 
 thread_local! {
-    static RUNTIME_STORE: RuntimeStore = RuntimeStore::default();
+    static RUNTIME_CONTROLLER: RuntimeController = RuntimeController::default();
 }
 
 pub struct SimRnsPlugin;
@@ -189,35 +189,30 @@ extern "C" fn can_stop_project_command() -> bool {
 }
 
 fn runtime_command_status(command: impl FnOnce() -> Result<(), String>) -> MzStatus {
-    match command() {
-        Ok(()) => {
-            refresh_runtime_store();
-            MzStatus::OK
-        }
+    match RUNTIME_CONTROLLER
+        .with(|controller| controller.run_command(command, load_runtime_snapshot))
+    {
+        Ok(()) => MzStatus::OK,
         Err(error) => {
             eprintln!("sim-rns: runtime command failed: {error}");
-            publish_runtime_error(error);
             MzStatus::new(MzStatusCode::InternalError)
         }
     }
 }
 
 fn current_runtime_vm_state() -> Option<RuntimeVmState> {
-    RUNTIME_STORE.with(|store| store.latest_or_refresh(load_runtime_snapshot).vm_state())
+    RUNTIME_CONTROLLER.with(|controller| controller.vm_state(load_runtime_snapshot))
 }
 
 fn refresh_runtime_store() {
-    RUNTIME_STORE.with(|store| {
-        store.refresh(load_runtime_snapshot);
+    RUNTIME_CONTROLLER.with(|controller| {
+        controller.refresh(load_runtime_snapshot);
     });
 }
 
 fn publish_runtime_error(error: String) {
-    RUNTIME_STORE.with(|store| {
-        let snapshot = store
-            .latest_or_refresh(load_runtime_snapshot)
-            .with_error(error);
-        store.publish(snapshot);
+    RUNTIME_CONTROLLER.with(|controller| {
+        controller.publish_error(error, load_runtime_snapshot);
     });
 }
 
@@ -1046,7 +1041,8 @@ extern "C" fn create_overview_view(
         return std::ptr::null_mut();
     }
 
-    let snapshot = RUNTIME_STORE.with(|store| store.latest_or_refresh(load_runtime_snapshot));
+    let snapshot =
+        RUNTIME_CONTROLLER.with(|controller| controller.latest_or_refresh(load_runtime_snapshot));
     let title = snapshot
         .project
         .as_ref()
@@ -1070,8 +1066,8 @@ extern "C" fn create_overview_view(
 
     let list_for_updates = list.downgrade();
     let error_label_for_updates = error_label.downgrade();
-    let subscription = RUNTIME_STORE.with(|store| {
-        store.subscribe(Rc::new(move |snapshot| {
+    let subscription = RUNTIME_CONTROLLER.with(|controller| {
+        controller.subscribe(Rc::new(move |snapshot| {
             let Some(list) = list_for_updates.upgrade() else {
                 return;
             };
