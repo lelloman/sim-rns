@@ -12,8 +12,9 @@ use maruzzella_sdk::{
 };
 use sim_rns_core::{
     add_node_include, add_script_include, close_project, create_project, current_project,
-    load_project, open_project, project_recipe, Element, LauncherConfig, Project, ProjectHandle,
-    Recipe, Template,
+    load_project, open_project, project_recipe, Element, FileBackedRuntime, LauncherConfig,
+    NodeRuntimeState, Project, ProjectHandle, ProjectRuntime, Recipe, RuntimeCommand,
+    RuntimeStatus, Template,
 };
 
 const PLUGIN_ID: &str = "com.lelloman.sim_rns";
@@ -441,12 +442,92 @@ fn build_project_summary(project: &Project) -> Vec<String> {
     ]
 }
 
-fn populate_overview_list(list: &ListBox, project: &Project, recipe: &Recipe) {
+fn runtime_summary_lines(status: &RuntimeStatus) -> Vec<String> {
+    vec![
+        format!("VM state = {:?}", status.vm_state),
+        format!("Backend state = {:?}", status.backend_state),
+        format!("Nodes = {}", status.nodes.len()),
+        format!(
+            "Effective topology links = {}",
+            status.effective_topology.len()
+        ),
+        format!("Snapshots = {}", status.snapshots.len()),
+    ]
+}
+
+fn runtime_node_lines(status: &RuntimeStatus) -> Vec<String> {
+    status
+        .nodes
+        .iter()
+        .map(|node| {
+            format!(
+                "{} [{}] enabled={} state={:?}",
+                node.element_id, node.template_id, node.enabled, node.state
+            )
+        })
+        .collect()
+}
+
+fn runtime_topology_lines(status: &RuntimeStatus) -> Vec<String> {
+    if status.effective_topology.is_empty() {
+        return vec!["No active topology links.".to_string()];
+    }
+    status
+        .effective_topology
+        .iter()
+        .map(|attachment| format!("{} -> {}", attachment.element_id, attachment.network_id))
+        .collect()
+}
+
+fn runtime_snapshot_lines(status: &RuntimeStatus) -> Vec<String> {
+    if status.snapshots.is_empty() {
+        return vec!["No snapshots have been created.".to_string()];
+    }
+    status
+        .snapshots
+        .iter()
+        .map(|snapshot| {
+            format!(
+                "{} `{}` vm={:?}",
+                snapshot.id, snapshot.name, snapshot.vm_state
+            )
+        })
+        .collect()
+}
+
+fn runtime_event_lines(status: &RuntimeStatus) -> Vec<String> {
+    if status.recent_events.is_empty() {
+        return vec!["No runtime commands have been recorded.".to_string()];
+    }
+    status
+        .recent_events
+        .iter()
+        .map(|event| format!("#{} {}", event.id, event.message))
+        .collect()
+}
+
+fn populate_overview_list(
+    list: &ListBox,
+    project: &Project,
+    recipe: &Recipe,
+    status: &RuntimeStatus,
+) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
 
     list.append(&section_card("Project", &build_project_summary(project)));
+    list.append(&section_card("Runtime", &runtime_summary_lines(status)));
+    list.append(&section_card("Runtime Nodes", &runtime_node_lines(status)));
+    list.append(&section_card(
+        "Runtime Topology",
+        &runtime_topology_lines(status),
+    ));
+    list.append(&section_card("Snapshots", &runtime_snapshot_lines(status)));
+    list.append(&section_card(
+        "Recent Runtime Events",
+        &runtime_event_lines(status),
+    ));
     list.append(&section_card("Overview", &overview_lines(recipe)));
     list.append(&section_card("Startup Order", &recipe.startup.order));
 
@@ -461,14 +542,69 @@ fn populate_overview_list(list: &ListBox, project: &Project, recipe: &Recipe) {
 fn reload_overview(list: &ListBox, error_label: &Label) {
     match load_workspace_project().and_then(|project| {
         let recipe = project_recipe(&project)?;
-        Ok((project, recipe))
+        let status = FileBackedRuntime
+            .status(&project)
+            .map_err(|error| error.to_string())?;
+        Ok((project, recipe, status))
     }) {
-        Ok((project, recipe)) => {
-            populate_overview_list(list, &project, &recipe);
+        Ok((project, recipe, status)) => {
+            populate_overview_list(list, &project, &recipe, &status);
             set_error(error_label, "");
         }
         Err(error) => set_error(error_label, &error),
     }
+}
+
+fn execute_runtime_command(
+    list: &ListBox,
+    error_label: &Label,
+    command: RuntimeCommand,
+) -> Result<(), String> {
+    let project = load_workspace_project()?;
+    FileBackedRuntime
+        .execute(&project, command)
+        .map_err(|error| error.to_string())?;
+    reload_overview(list, error_label);
+    Ok(())
+}
+
+fn execute_runtime_command_for_all_nodes(
+    list: &ListBox,
+    error_label: &Label,
+    command_for_node: impl Fn(String) -> RuntimeCommand,
+) -> Result<(), String> {
+    let project = load_workspace_project()?;
+    let status = FileBackedRuntime
+        .status(&project)
+        .map_err(|error| error.to_string())?;
+    for node in status
+        .nodes
+        .into_iter()
+        .filter(|node| node.enabled && node.state != NodeRuntimeState::Disabled)
+    {
+        FileBackedRuntime
+            .execute(&project, command_for_node(node.element_id))
+            .map_err(|error| error.to_string())?;
+    }
+    reload_overview(list, error_label);
+    Ok(())
+}
+
+fn restore_latest_snapshot(list: &ListBox, error_label: &Label) -> Result<(), String> {
+    let project = load_workspace_project()?;
+    let status = FileBackedRuntime
+        .status(&project)
+        .map_err(|error| error.to_string())?;
+    let snapshot_id = status
+        .snapshots
+        .first()
+        .map(|snapshot| snapshot.id.clone())
+        .ok_or_else(|| "no snapshots are available to restore".to_string())?;
+    FileBackedRuntime
+        .execute(&project, RuntimeCommand::RestoreSnapshot { snapshot_id })
+        .map_err(|error| error.to_string())?;
+    reload_overview(list, error_label);
+    Ok(())
 }
 
 fn append_empty_recent_row(list: &ListBox) {
@@ -832,25 +968,57 @@ extern "C" fn create_overview_view(
             };
         }
     };
+    let status = match FileBackedRuntime.status(&project) {
+        Ok(status) => status,
+        Err(error) => {
+            let root = build_root("Project runtime failed to load", &error.to_string());
+            return unsafe {
+                <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+                    as *mut std::ffi::c_void
+            };
+        }
+    };
     let root = build_root(
         &project.file.name,
-        "The current workspace is now bound to the selected project root and derives its scaffold recipe from the root file plus imported project files.",
+        "The workspace is bound to the selected project root and drives the simulated runtime contract that will later be backed by the VM.",
     );
-    let action_bar = GtkBox::new(Orientation::Horizontal, 8);
+    let action_area = GtkBox::new(Orientation::Vertical, 8);
+    let runtime_action_bar = GtkBox::new(Orientation::Horizontal, 8);
+    let project_action_bar = GtkBox::new(Orientation::Horizontal, 8);
     let close_project_button = Button::with_label("Close Project");
+    let boot_button = Button::with_label("Boot");
+    let pause_button = Button::with_label("Pause");
+    let resume_button = Button::with_label("Resume");
+    let shutdown_button = Button::with_label("Shutdown");
+    let snapshot_button = Button::with_label("Snapshot");
+    let restore_button = Button::with_label("Restore Latest");
+    let start_nodes_button = Button::with_label("Start Nodes");
+    let stop_nodes_button = Button::with_label("Stop Nodes");
+    let restart_nodes_button = Button::with_label("Restart Nodes");
     let add_script_button = Button::with_label("Add Script");
     let add_node_button = Button::with_label("Add Node");
-    action_bar.append(&close_project_button);
-    action_bar.append(&add_script_button);
-    action_bar.append(&add_node_button);
-    root.append(&action_bar);
+    runtime_action_bar.append(&boot_button);
+    runtime_action_bar.append(&pause_button);
+    runtime_action_bar.append(&resume_button);
+    runtime_action_bar.append(&shutdown_button);
+    runtime_action_bar.append(&snapshot_button);
+    runtime_action_bar.append(&restore_button);
+    runtime_action_bar.append(&start_nodes_button);
+    runtime_action_bar.append(&stop_nodes_button);
+    runtime_action_bar.append(&restart_nodes_button);
+    project_action_bar.append(&close_project_button);
+    project_action_bar.append(&add_script_button);
+    project_action_bar.append(&add_node_button);
+    action_area.append(&runtime_action_bar);
+    action_area.append(&project_action_bar);
+    root.append(&action_area);
 
     let error_label = workspace_error_label();
     root.append(&error_label);
 
     let list = ListBox::new();
     list.set_selection_mode(SelectionMode::None);
-    populate_overview_list(&list, &project, &recipe);
+    populate_overview_list(&list, &project, &recipe, &status);
 
     let scroller = create_scroller();
     scroller.set_child(Some(&list));
@@ -860,6 +1028,118 @@ extern "C" fn create_overview_view(
     close_project_button.connect_clicked(move |_| match close_project() {
         Ok(()) => set_error(&error_label_for_close, ""),
         Err(error) => set_error(&error_label_for_close, &error),
+    });
+
+    let list_for_boot = list.clone();
+    let error_label_for_boot = error_label.clone();
+    boot_button.connect_clicked(move |_| {
+        match execute_runtime_command(&list_for_boot, &error_label_for_boot, RuntimeCommand::Boot) {
+            Ok(()) => set_error(&error_label_for_boot, ""),
+            Err(error) => set_error(&error_label_for_boot, &error),
+        }
+    });
+
+    let list_for_pause = list.clone();
+    let error_label_for_pause = error_label.clone();
+    pause_button.connect_clicked(move |_| {
+        match execute_runtime_command(
+            &list_for_pause,
+            &error_label_for_pause,
+            RuntimeCommand::Pause,
+        ) {
+            Ok(()) => set_error(&error_label_for_pause, ""),
+            Err(error) => set_error(&error_label_for_pause, &error),
+        }
+    });
+
+    let list_for_resume = list.clone();
+    let error_label_for_resume = error_label.clone();
+    resume_button.connect_clicked(move |_| {
+        match execute_runtime_command(
+            &list_for_resume,
+            &error_label_for_resume,
+            RuntimeCommand::Resume,
+        ) {
+            Ok(()) => set_error(&error_label_for_resume, ""),
+            Err(error) => set_error(&error_label_for_resume, &error),
+        }
+    });
+
+    let list_for_shutdown = list.clone();
+    let error_label_for_shutdown = error_label.clone();
+    shutdown_button.connect_clicked(move |_| {
+        match execute_runtime_command(
+            &list_for_shutdown,
+            &error_label_for_shutdown,
+            RuntimeCommand::Shutdown,
+        ) {
+            Ok(()) => set_error(&error_label_for_shutdown, ""),
+            Err(error) => set_error(&error_label_for_shutdown, &error),
+        }
+    });
+
+    let list_for_snapshot = list.clone();
+    let error_label_for_snapshot = error_label.clone();
+    snapshot_button.connect_clicked(move |_| {
+        match execute_runtime_command(
+            &list_for_snapshot,
+            &error_label_for_snapshot,
+            RuntimeCommand::CreateSnapshot {
+                name: "Manual Snapshot".to_string(),
+                note: Some("Created from the workspace scaffold.".to_string()),
+            },
+        ) {
+            Ok(()) => set_error(&error_label_for_snapshot, ""),
+            Err(error) => set_error(&error_label_for_snapshot, &error),
+        }
+    });
+
+    let list_for_restore = list.clone();
+    let error_label_for_restore = error_label.clone();
+    restore_button.connect_clicked(move |_| {
+        match restore_latest_snapshot(&list_for_restore, &error_label_for_restore) {
+            Ok(()) => set_error(&error_label_for_restore, ""),
+            Err(error) => set_error(&error_label_for_restore, &error),
+        }
+    });
+
+    let list_for_start_nodes = list.clone();
+    let error_label_for_start_nodes = error_label.clone();
+    start_nodes_button.connect_clicked(move |_| {
+        match execute_runtime_command_for_all_nodes(
+            &list_for_start_nodes,
+            &error_label_for_start_nodes,
+            |element_id| RuntimeCommand::StartNode { element_id },
+        ) {
+            Ok(()) => set_error(&error_label_for_start_nodes, ""),
+            Err(error) => set_error(&error_label_for_start_nodes, &error),
+        }
+    });
+
+    let list_for_stop_nodes = list.clone();
+    let error_label_for_stop_nodes = error_label.clone();
+    stop_nodes_button.connect_clicked(move |_| {
+        match execute_runtime_command_for_all_nodes(
+            &list_for_stop_nodes,
+            &error_label_for_stop_nodes,
+            |element_id| RuntimeCommand::StopNode { element_id },
+        ) {
+            Ok(()) => set_error(&error_label_for_stop_nodes, ""),
+            Err(error) => set_error(&error_label_for_stop_nodes, &error),
+        }
+    });
+
+    let list_for_restart_nodes = list.clone();
+    let error_label_for_restart_nodes = error_label.clone();
+    restart_nodes_button.connect_clicked(move |_| {
+        match execute_runtime_command_for_all_nodes(
+            &list_for_restart_nodes,
+            &error_label_for_restart_nodes,
+            |element_id| RuntimeCommand::RestartNode { element_id },
+        ) {
+            Ok(()) => set_error(&error_label_for_restart_nodes, ""),
+            Err(error) => set_error(&error_label_for_restart_nodes, &error),
+        }
     });
 
     let list_for_script = list.clone();

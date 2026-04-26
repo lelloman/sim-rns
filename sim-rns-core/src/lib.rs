@@ -5,6 +5,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub mod runtime;
+pub use runtime::{
+    FileBackedRuntime, NodeRuntimeState, ProjectRuntime, RuntimeBackendState, RuntimeCommand,
+    RuntimeCommandOutcome, RuntimeError, RuntimeEvent, RuntimeSnapshot, RuntimeStatus,
+    RuntimeTopologyOverlay, RuntimeVmState,
+};
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Recipe {
     pub metadata: RecipeMetadata,
@@ -122,7 +129,7 @@ pub struct Topology {
     pub attachments: Vec<Attachment>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Attachment {
     pub element_id: String,
     pub network_id: String,
