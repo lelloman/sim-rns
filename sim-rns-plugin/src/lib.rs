@@ -12,9 +12,8 @@ use maruzzella_sdk::{
 };
 use sim_rns_core::{
     add_node_include, add_script_include, close_project, create_project, current_project,
-    load_project, open_project, project_recipe, Element, FileBackedRuntime, LauncherConfig,
-    NodeRuntimeState, Project, ProjectHandle, ProjectRuntime, Recipe, RuntimeCommand,
-    RuntimeStatus, Template,
+    load_project, open_project, project_recipe, Element, LauncherConfig, NodeRuntimeState, Project,
+    ProjectHandle, ProjectRuntime, QemuRuntime, Recipe, RuntimeCommand, RuntimeStatus, Template,
 };
 
 const PLUGIN_ID: &str = "com.lelloman.sim_rns";
@@ -446,6 +445,10 @@ fn runtime_summary_lines(status: &RuntimeStatus) -> Vec<String> {
     vec![
         format!("VM state = {:?}", status.vm_state),
         format!("Backend state = {:?}", status.backend_state),
+        format!("VM assets prepared = {}", status.vm_assets.prepared),
+        format!("VM disk = {}", status.vm_assets.disk_image_path),
+        format!("QMP socket = {}", status.vm_assets.qmp_socket_path),
+        format!("VM log = {}", status.vm_assets.log_path),
         format!("Nodes = {}", status.nodes.len()),
         format!(
             "Effective topology links = {}",
@@ -542,7 +545,7 @@ fn populate_overview_list(
 fn reload_overview(list: &ListBox, error_label: &Label) {
     match load_workspace_project().and_then(|project| {
         let recipe = project_recipe(&project)?;
-        let status = FileBackedRuntime
+        let status = QemuRuntime::default()
             .status(&project)
             .map_err(|error| error.to_string())?;
         Ok((project, recipe, status))
@@ -561,7 +564,7 @@ fn execute_runtime_command(
     command: RuntimeCommand,
 ) -> Result<(), String> {
     let project = load_workspace_project()?;
-    FileBackedRuntime
+    QemuRuntime::default()
         .execute(&project, command)
         .map_err(|error| error.to_string())?;
     reload_overview(list, error_label);
@@ -574,7 +577,7 @@ fn execute_runtime_command_for_all_nodes(
     command_for_node: impl Fn(String) -> RuntimeCommand,
 ) -> Result<(), String> {
     let project = load_workspace_project()?;
-    let status = FileBackedRuntime
+    let status = QemuRuntime::default()
         .status(&project)
         .map_err(|error| error.to_string())?;
     for node in status
@@ -582,7 +585,7 @@ fn execute_runtime_command_for_all_nodes(
         .into_iter()
         .filter(|node| node.enabled && node.state != NodeRuntimeState::Disabled)
     {
-        FileBackedRuntime
+        QemuRuntime::default()
             .execute(&project, command_for_node(node.element_id))
             .map_err(|error| error.to_string())?;
     }
@@ -592,7 +595,7 @@ fn execute_runtime_command_for_all_nodes(
 
 fn restore_latest_snapshot(list: &ListBox, error_label: &Label) -> Result<(), String> {
     let project = load_workspace_project()?;
-    let status = FileBackedRuntime
+    let status = QemuRuntime::default()
         .status(&project)
         .map_err(|error| error.to_string())?;
     let snapshot_id = status
@@ -600,7 +603,7 @@ fn restore_latest_snapshot(list: &ListBox, error_label: &Label) -> Result<(), St
         .first()
         .map(|snapshot| snapshot.id.clone())
         .ok_or_else(|| "no snapshots are available to restore".to_string())?;
-    FileBackedRuntime
+    QemuRuntime::default()
         .execute(&project, RuntimeCommand::RestoreSnapshot { snapshot_id })
         .map_err(|error| error.to_string())?;
     reload_overview(list, error_label);
@@ -968,7 +971,7 @@ extern "C" fn create_overview_view(
             };
         }
     };
-    let status = match FileBackedRuntime.status(&project) {
+    let status = match QemuRuntime::default().status(&project) {
         Ok(status) => status,
         Err(error) => {
             let root = build_root("Project runtime failed to load", &error.to_string());

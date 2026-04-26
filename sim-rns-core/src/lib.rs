@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 
 pub mod runtime;
 pub use runtime::{
-    FileBackedRuntime, NodeRuntimeState, ProjectRuntime, RuntimeBackendState, RuntimeCommand,
-    RuntimeCommandOutcome, RuntimeError, RuntimeEvent, RuntimeSnapshot, RuntimeStatus,
-    RuntimeTopologyOverlay, RuntimeVmState,
+    FileBackedRuntime, NodeRuntimeState, ProjectRuntime, QemuRuntime, RuntimeBackendState,
+    RuntimeCommand, RuntimeCommandOutcome, RuntimeError, RuntimeEvent, RuntimeSnapshot,
+    RuntimeStatus, RuntimeTopologyOverlay, RuntimeVmAssets, RuntimeVmLayout, RuntimeVmState,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
