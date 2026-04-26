@@ -989,6 +989,7 @@ extern "C" fn create_overview_view(
     let runtime_action_bar = GtkBox::new(Orientation::Horizontal, 8);
     let project_action_bar = GtkBox::new(Orientation::Horizontal, 8);
     let close_project_button = Button::with_label("Close Project");
+    let prepare_vm_button = Button::with_label("Prepare VM");
     let boot_button = Button::with_label("Boot");
     let pause_button = Button::with_label("Pause");
     let resume_button = Button::with_label("Resume");
@@ -1000,6 +1001,7 @@ extern "C" fn create_overview_view(
     let restart_nodes_button = Button::with_label("Restart Nodes");
     let add_script_button = Button::with_label("Add Script");
     let add_node_button = Button::with_label("Add Node");
+    runtime_action_bar.append(&prepare_vm_button);
     runtime_action_bar.append(&boot_button);
     runtime_action_bar.append(&pause_button);
     runtime_action_bar.append(&resume_button);
@@ -1031,6 +1033,22 @@ extern "C" fn create_overview_view(
     close_project_button.connect_clicked(move |_| match close_project() {
         Ok(()) => set_error(&error_label_for_close, ""),
         Err(error) => set_error(&error_label_for_close, &error),
+    });
+
+    let list_for_prepare_vm = list.clone();
+    let error_label_for_prepare_vm = error_label.clone();
+    prepare_vm_button.connect_clicked(move |_| {
+        match execute_runtime_command(
+            &list_for_prepare_vm,
+            &error_label_for_prepare_vm,
+            RuntimeCommand::PrepareVm {
+                source_image: None,
+                size_gb: 8,
+            },
+        ) {
+            Ok(()) => set_error(&error_label_for_prepare_vm, ""),
+            Err(error) => set_error(&error_label_for_prepare_vm, &error),
+        }
     });
 
     let list_for_boot = list.clone();

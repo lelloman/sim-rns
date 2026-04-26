@@ -103,6 +103,10 @@ pub struct RuntimeVmAssets {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RuntimeCommand {
+    PrepareVm {
+        source_image: Option<String>,
+        size_gb: u32,
+    },
     Boot,
     Shutdown,
     Pause,
@@ -184,12 +188,14 @@ pub struct FileBackedRuntime;
 #[derive(Clone, Debug)]
 pub struct QemuRuntime {
     qemu_binary: String,
+    qemu_img_binary: String,
 }
 
 impl Default for QemuRuntime {
     fn default() -> Self {
         Self {
             qemu_binary: "qemu-system-x86_64".to_string(),
+            qemu_img_binary: "qemu-img".to_string(),
         }
     }
 }
@@ -198,7 +204,13 @@ impl QemuRuntime {
     pub fn new(qemu_binary: impl Into<String>) -> Self {
         Self {
             qemu_binary: qemu_binary.into(),
+            qemu_img_binary: "qemu-img".to_string(),
         }
+    }
+
+    pub fn with_qemu_img_binary(mut self, qemu_img_binary: impl Into<String>) -> Self {
+        self.qemu_img_binary = qemu_img_binary.into();
+        self
     }
 
     pub fn layout(&self, project: &Project) -> RuntimeVmLayout {
@@ -290,6 +302,19 @@ impl ProjectRuntime for QemuRuntime {
         command: RuntimeCommand,
     ) -> Result<RuntimeCommandOutcome, RuntimeError> {
         match command {
+            RuntimeCommand::PrepareVm {
+                source_image,
+                size_gb,
+            } => {
+                self.prepare_vm(project, source_image, size_gb)?;
+                FileBackedRuntime.execute(
+                    project,
+                    RuntimeCommand::PrepareVm {
+                        source_image: None,
+                        size_gb,
+                    },
+                )
+            }
             RuntimeCommand::Boot => {
                 self.boot(project)?;
                 FileBackedRuntime.execute(project, RuntimeCommand::Boot)
@@ -312,6 +337,63 @@ impl ProjectRuntime for QemuRuntime {
 }
 
 impl QemuRuntime {
+    fn prepare_vm(
+        &self,
+        project: &Project,
+        source_image: Option<String>,
+        size_gb: u32,
+    ) -> Result<(), RuntimeError> {
+        let layout = self.layout(project);
+        ensure_runtime_layout(&layout)?;
+        if layout.disk_image_path.exists() {
+            return Err(RuntimeError::Validation(format!(
+                "VM disk image already exists at {}",
+                layout.disk_image_path.display()
+            )));
+        }
+        if let Some(source_image) = source_image {
+            let source_path = PathBuf::from(source_image);
+            if !source_path.is_file() {
+                return Err(RuntimeError::Validation(format!(
+                    "source VM image does not exist at {}",
+                    source_path.display()
+                )));
+            }
+            std::fs::copy(&source_path, &layout.disk_image_path).map_err(|error| {
+                RuntimeError::Persistence(format!(
+                    "failed to import {} to {}: {error}",
+                    source_path.display(),
+                    layout.disk_image_path.display()
+                ))
+            })?;
+            return Ok(());
+        }
+
+        let disk_size_gb = if size_gb == 0 { 8 } else { size_gb };
+        let status = Command::new(&self.qemu_img_binary)
+            .arg("create")
+            .arg("-f")
+            .arg("qcow2")
+            .arg(&layout.disk_image_path)
+            .arg(format!("{disk_size_gb}G"))
+            .status()
+            .map_err(|error| {
+                RuntimeError::Unavailable(format!(
+                    "failed to run `{}`: {error}",
+                    self.qemu_img_binary
+                ))
+            })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(RuntimeError::Unavailable(format!(
+                "`{}` failed to create {}",
+                self.qemu_img_binary,
+                layout.disk_image_path.display()
+            )))
+        }
+    }
+
     fn boot(&self, project: &Project) -> Result<(), RuntimeError> {
         let layout = self.layout(project);
         ensure_runtime_layout(&layout)?;
@@ -552,6 +634,7 @@ fn apply_command(
     timestamp: u64,
 ) -> Result<String, RuntimeError> {
     match command {
+        RuntimeCommand::PrepareVm { .. } => Ok("VM assets prepared.".to_string()),
         RuntimeCommand::Boot => {
             state.vm_state = RuntimeVmState::Running;
             state.backend_state = RuntimeBackendState::Reachable;
@@ -1157,5 +1240,60 @@ mod tests {
         assert!(runtime.layout(&project).vm_dir.is_dir());
         assert!(runtime.layout(&project).logs_dir.is_dir());
         assert!(runtime.layout(&project).snapshots_dir.is_dir());
+    }
+
+    #[test]
+    fn qemu_prepare_vm_imports_source_image() {
+        let root = unique_test_dir("sim-rns-qemu-prepare-import");
+        let project = create_project(&root, "QEMU Import").expect("project should be created");
+        let source_image = root.join("base.qcow2");
+        std::fs::write(&source_image, b"base image bytes").expect("source should be written");
+        let runtime = QemuRuntime::new("definitely-not-qemu");
+
+        let status = runtime
+            .execute(
+                &project,
+                RuntimeCommand::PrepareVm {
+                    source_image: Some(source_image.to_string_lossy().into_owned()),
+                    size_gb: 8,
+                },
+            )
+            .expect("prepare should import source image")
+            .status;
+
+        let layout = runtime.layout(&project);
+        assert!(status.vm_assets.prepared);
+        assert_eq!(
+            std::fs::read(&layout.disk_image_path).expect("disk should exist"),
+            b"base image bytes"
+        );
+        assert!(layout.snapshots_dir.is_dir());
+        assert!(layout.logs_dir.is_dir());
+    }
+
+    #[test]
+    fn qemu_prepare_vm_refuses_to_overwrite_existing_disk() {
+        let root = unique_test_dir("sim-rns-qemu-prepare-overwrite");
+        let project = create_project(&root, "QEMU Overwrite").expect("project should be created");
+        let runtime = QemuRuntime::new("definitely-not-qemu");
+        let layout = runtime.layout(&project);
+        std::fs::create_dir_all(&layout.vm_dir).expect("vm dir should be created");
+        std::fs::write(&layout.disk_image_path, b"existing").expect("disk should be written");
+
+        let error = runtime
+            .execute(
+                &project,
+                RuntimeCommand::PrepareVm {
+                    source_image: None,
+                    size_gb: 8,
+                },
+            )
+            .expect_err("prepare should not overwrite existing disk");
+
+        assert!(matches!(error, RuntimeError::Validation(_)));
+        assert_eq!(
+            std::fs::read(&layout.disk_image_path).expect("disk should still exist"),
+            b"existing"
+        );
     }
 }
