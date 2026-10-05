@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub mod editor;
 mod guest;
 pub mod persistence;
 mod qmp;
@@ -781,6 +782,17 @@ fn build_script_element(root_path: &Path, relative_path: &str) -> Result<Element
 }
 
 pub fn project_recipe(project: &Project) -> Result<Recipe, String> {
+    let nodes = project
+        .file
+        .includes
+        .nodes
+        .iter()
+        .map(|path| load_node_file(&project.root_path, path))
+        .collect::<Result<Vec<_>, _>>()?;
+    recipe_with_nodes(project, nodes)
+}
+
+fn recipe_with_nodes(project: &Project, nodes: Vec<ProjectNodeFile>) -> Result<Recipe, String> {
     for path in project
         .file
         .includes
@@ -793,8 +805,7 @@ pub fn project_recipe(project: &Project) -> Result<Recipe, String> {
     let mut elements = Vec::new();
     let mut attachments = Vec::new();
 
-    for node_path in &project.file.includes.nodes {
-        let node = load_node_file(&project.root_path, node_path)?;
+    for node in nodes {
         attachments.extend(node.attachments.iter().map(|network_id| Attachment {
             element_id: node.id.clone(),
             network_id: network_id.clone(),

@@ -185,3 +185,88 @@ fn missing_assets_and_symlink_escapes_are_rejected() {
     assert!(project_recipe(&p).is_err());
     std::fs::remove_dir_all(p.root_path).unwrap();
 }
+
+#[test]
+fn editor_validates_conflicts_and_removal_without_losing_sources() {
+    use editor::{apply, load, Edit};
+    let p = project("node-editor");
+    let snapshot = load(&p.root_path).unwrap();
+    let mut node = snapshot.nodes[1].1.clone();
+    node.id = "new-node".into();
+    let save = |node| Edit::SaveNode {
+        original_id: None,
+        node,
+    };
+    let mut invalid = node.clone();
+    invalid.attachments = vec!["missing-lan".into()];
+    assert!(apply(&snapshot, save(invalid), false).is_err());
+    assert_eq!(snapshot, load(&p.root_path).unwrap());
+    let mut invalid = node.clone();
+    invalid.id = "../escape".into();
+    assert!(apply(&snapshot, save(invalid), false).is_err());
+    apply(&snapshot, save(node.clone()), false).unwrap();
+    assert!(apply(&snapshot, save(node.clone()), false)
+        .unwrap_err()
+        .contains("changed"));
+    let next = load(&p.root_path).unwrap();
+    assert!(apply(&next, save(node), false).is_err()); // duplicate ID
+    let lan_path = next
+        .nodes
+        .iter()
+        .find(|(_, n)| n.id == "lan-main")
+        .unwrap()
+        .0
+        .clone();
+    apply(
+        &next,
+        Edit::RemoveNode {
+            id: "lan-main".into(),
+        },
+        false,
+    )
+    .unwrap();
+    let next = load(&p.root_path).unwrap();
+    assert!(next.nodes.iter().all(|(_, n)| n.attachments.is_empty()));
+    assert!(!next.project.file.startup.order.contains(&"lan-main".into()));
+    assert!(p.root_path.join(lan_path).exists());
+    std::fs::remove_dir_all(p.root_path).unwrap();
+}
+
+#[test]
+fn editor_archives_prepared_guest_only_with_explicit_choice() {
+    use editor::{apply, load, Edit};
+    let p = project("editor-archive");
+    let layout = QemuRuntime::default().layout(&p);
+    std::fs::create_dir_all(&layout.vm_dir).unwrap();
+    std::fs::write(&layout.disk_image_path, "previous guest data").unwrap();
+    let snapshot = load(&p.root_path).unwrap();
+    let edit = Edit::SaveScript {
+        path: snapshot.scripts[0].0.clone(),
+        contents: "print('edited')\n".into(),
+    };
+    assert!(apply(&snapshot, edit.clone(), false)
+        .unwrap_err()
+        .contains("fresh guest"));
+    assert_eq!(snapshot, load(&p.root_path).unwrap());
+    apply(&snapshot, edit, true).unwrap();
+    assert!(!layout.disk_image_path.exists());
+    let backup = std::fs::read_dir(&layout.runtime_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().starts_with("previous-vm-"))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(
+            backup
+                .path()
+                .join(layout.disk_image_path.file_name().unwrap())
+        )
+        .unwrap(),
+        "previous guest data"
+    );
+    assert_eq!(
+        load(&p.root_path).unwrap().scripts[0].1,
+        "print('edited')\n"
+    );
+    std::fs::remove_dir_all(p.root_path).unwrap();
+}

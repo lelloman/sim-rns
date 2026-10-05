@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--guest-bundle", type=Path)
     parser.add_argument("--filtered-launch", action="store_true")
     parser.add_argument("--screenshot", type=Path)
+    parser.add_argument("--editor-screenshot", type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     with tempfile.TemporaryDirectory(prefix="sim-rns-mcp-") as directory:
@@ -43,6 +44,19 @@ def main():
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=log, text=True, bufsize=1)
             sequence = 0
+            app_pid = None
+
+            def wait_app_exit():
+                deadline = time.monotonic() + 10
+                while app_pid and Path(f"/proc/{app_pid}").exists():
+                    status = Path(f"/proc/{app_pid}/stat")
+                    try:
+                        if status.read_text().split(") ", 1)[1].startswith("Z"):
+                            return
+                    except FileNotFoundError:
+                        return
+                    assert time.monotonic() < deadline, "app did not exit"
+                    time.sleep(.1)
 
             def send(message):
                 server.stdin.write(json.dumps(dict(jsonrpc="2.0", **message)) + "\n")
@@ -81,6 +95,86 @@ def main():
                     for child in item.get("children", []):
                         yield from walk(child)
                 return [item for window in tool("ui", "tree")["windows"] for item in walk(window)]
+
+            def named(name):
+                return next(item for item in widgets() if item.get("name") == name and item["mapped"])
+
+            def activate_name(name):
+                deadline = time.monotonic() + 10
+                while not named(name)["sensitive"]:
+                    assert time.monotonic() < deadline, name
+                    time.sleep(.1)
+                tool("ui", "activate", widget_id=named(name)["id"])
+
+            def set_name(name, text):
+                tool("ui", "set_text", widget_id=named(name)["id"], text=text)
+
+            def wait_saved():
+                deadline = time.monotonic() + 10
+                while True:
+                    tree = widgets()
+                    if not any(item.get("name") in ["node-save", "script-save"] and item["mapped"] for item in tree):
+                        break
+                    assert time.monotonic() < deadline, [i.get("text") for i in tree if i["mapped"] and i.get("text")]
+                    time.sleep(.1)
+
+            def nodes_tab():
+                header = next(item for item in widgets() if "tab-header" in item["css_classes"] and any(c.get("text") == "Nodes" for c in item.get("children", [])))
+                tool("ui", "activate", widget_id=header["id"])
+                deadline = time.monotonic() + 10
+                while not named("nodes-add")["sensitive"]:
+                    assert time.monotonic() < deadline
+                    time.sleep(.1)
+
+            def test_node_editor():
+                nodes_tab()
+                activate_name("nodes-add")
+                set_name("node-id", "../invalid")
+                activate_name("node-save")
+                deadline = time.monotonic() + 10
+                while tool("app", "state")["runtime_busy"]:
+                    assert time.monotonic() < deadline
+                    time.sleep(.1)
+                assert any("invalid or duplicate" in i.get("text", "") and i["mapped"] for i in widgets())
+                set_name("node-id", "edited-node")
+                tool("ui", "set_active", widget_id=named("node-lan-lan-main")["id"], active=True)
+                set_name("node-env", "EDITOR_TEST=yes")
+                tool("ui", "set_value", widget_id=named("node-memory")["id"], value=128)
+                activate_name("node-save")
+                wait_saved()
+                recipe = tool("project", "inspect")["recipe"]
+                node = next(n for n in recipe["elements"] if n["id"] == "edited-node")
+                assert node["env"] == {"EDITOR_TEST":"yes"} and node["resources"]["memory_mb"] == 128
+                assert {"element_id":"edited-node", "network_id":"lan-main"} in recipe["topology"]["attachments"]
+                activate_name("node-edit-edited-node")
+                if args.editor_screenshot:
+                    window = next(w for w in tool("ui", "tree")["windows"] if w.get("title") == "Edit Node" and w["mapped"])
+                    shot = tool("ui", "screenshot", window_id=window["id"])
+                    args.editor_screenshot.write_bytes(base64.b64decode(shot["data"]))
+                tool("ui", "select", widget_id=named("node-template")["id"], index=2)
+                code = "print('editor script')\nprint('second line')\n"
+                set_name("node-script", code)
+                activate_name("node-save")
+                wait_saved()
+                activate_name("node-edit-edited-node")
+                assert named("node-script")["text"] == code
+                activate_name("node-save")
+                wait_saved()
+                node = next(n for n in tool("project", "inspect")["recipe"]["elements"] if n["id"] == "edited-node")
+                assert node["command_override"] == ["python3", "-c", code]
+                activate_name("node-edit-edited-node")
+                activate_name("node-remove")
+                remove = next(i for i in widgets() if i.get("label") == "Remove" and i["mapped"])
+                tool("ui", "activate", widget_id=remove["id"])
+                wait_saved()
+                assert not any(n["id"] == "edited-node" for n in tool("project", "inspect")["recipe"]["elements"])
+                nodes_tab()
+                button = next(i for i in widgets() if i.get("label") == "Edit scripts/traffic_seed.py" and i["mapped"])
+                tool("ui", "activate", widget_id=button["id"])
+                set_name("project-script", "print('changed through the editor')\n")
+                activate_name("script-save")
+                wait_saved()
+                assert "changed through the editor" in tool("project", "read_file", path="scripts/traffic_seed.py")["contents"]
 
             def close_in_ui():
                 tool("project", "close")
@@ -132,6 +226,7 @@ def main():
                 assert "error" in invalid or invalid.get("result", {}).get("isError"), invalid
                 tool("app", "state", error=True)  # No app yet: a tool error, not a server crash.
                 state = tool("launch")
+                app_pid = state["pid"]
                 assert state["project"] is None
                 assert tool("launch")["pid"] == state["pid"]
                 time.sleep(0.3)
@@ -142,6 +237,7 @@ def main():
                 assert tool("app", "state")["project"]["path"] == str(project)
                 assert tool("project", "inspect")["recipe"]["metadata"]["name"] == "MCP Integration"
                 time.sleep(0.3)
+                test_node_editor()
                 tree = widgets()
                 window = next(item for item in tree if "commands" in item and item["mapped"])
                 assert not any(item.get("text") in ["Workspace", "Activity"] and "tab-label" in item["css_classes"] for item in tree)
@@ -234,6 +330,9 @@ def main():
                             break
                         assert time.monotonic() < deadline, "Reticulum packets not received"
                         time.sleep(1)
+                    header = next(item for item in widgets() if "tab-header" in item["css_classes"] and any(c.get("text") == "Nodes" for c in item.get("children", [])))
+                    tool("ui", "activate", widget_id=header["id"])
+                    assert not named("nodes-add")["sensitive"]
                     tool("runtime", "stop_node", element_id="phone-a")
                     assert next(n for n in tool("runtime", "status")["nodes"] if n["element_id"] == "phone-a")["state"] == "stopped"
                     tool("runtime", "start_node", element_id="phone-a")
@@ -243,8 +342,52 @@ def main():
                     tool("runtime", "resume")
                     tool("runtime", "shutdown")
                     assert tool("runtime", "status")["vm_state"] == "stopped"
+                    nodes_tab()
+                    activate_name("node-edit-phone-a")
+                    set_name("node-env", "EDITOR_REBOOT=applied")
+                    activate_name("node-save")
+                    deadline = time.monotonic() + 10
+                    while tool("app", "state")["runtime_busy"]:
+                        assert time.monotonic() < deadline
+                        time.sleep(.1)
+                    assert any("prepared guest" in i.get("text", "") and i["mapped"] for i in widgets())
+                    tool("ui", "set_active", widget_id=named("node-fresh-guest")["id"], active=True)
+                    activate_name("node-save")
+                    wait_saved()
+                    assert list((demo / ".sim-rns").glob("previous-vm-*"))
+                    tool("runtime", "boot")
+                    deadline = time.monotonic() + 60
+                    while True:
+                        status = tool("runtime", "status")
+                        if all(any("RECEIVED hello" in line for line in status["node_logs"].get(node, [])) for node in ["backbone-a", "phone-a"]):
+                            break
+                        assert time.monotonic() < deadline, "edited guest did not exchange packets"
+                        time.sleep(1)
+                    tool("runtime", "shutdown")
                 tool("project", "close")
                 tool("app", "quit")
+                wait_app_exit()
+                # Simulate upgrading a saved workspace that predates the Nodes tab.
+                layout_path = work / "config/sim-rns--workspace/layout.json"
+                layout = json.loads(layout_path.read_text())
+                def remove_nodes(value):
+                    if isinstance(value, dict):
+                        for key, child in value.items():
+                            if key == "tabs":
+                                value[key] = [t for t in child if t.get("id") != "nodes"]
+                            else:
+                                remove_nodes(child)
+                    elif isinstance(value, list):
+                        for child in value:
+                            remove_nodes(child)
+                remove_nodes(layout)
+                layout_path.write_text(json.dumps(layout))
+                app_pid = tool("launch")["pid"]
+                tool("project", "open", path=str(project))
+                time.sleep(.3)
+                nodes_tab()
+                tool("app", "quit")
+                wait_app_exit()
                 print("PASS: MCP handshake, discovery, errors, launch/attach, GTK tabs/editor/screenshot, project edits/rollback, runtime" + (" and real QEMU guest" if args.guest_bundle else ""))
             except BaseException:
                 log.flush()
@@ -262,6 +405,7 @@ def main():
                             client.recv(1024 * 1024)
                     except OSError:
                         pass
+                wait_app_exit()
                 server.stdin.close()
                 try:
                     server.wait(timeout=10)

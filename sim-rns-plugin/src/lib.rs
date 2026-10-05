@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::thread;
 
+mod node_editor;
 mod runtime_store;
 
 use gtk::glib::translate::IntoGlibPtr;
@@ -132,6 +133,13 @@ impl Plugin for SimRnsPlugin {
             create_templates_view,
         ))?;
 
+        host.register_view_factory(ViewFactorySpec::new(
+            PLUGIN_ID,
+            "com.lelloman.sim_rns.nodes",
+            "Nodes",
+            MzViewPlacement::Workbench,
+            node_editor::create_view,
+        ))?;
         Ok(())
     }
 }
@@ -1366,41 +1374,22 @@ extern "C" fn create_recipe_view(
     );
     let list = ListBox::new();
     list.set_selection_mode(SelectionMode::None);
-    list.append(&section_card(
-        "Metadata",
-        &[
-            format!("id = {}", recipe.metadata.id),
-            format!("name = {}", recipe.metadata.name),
-            format!("description = {}", recipe.metadata.description),
-        ],
-    ));
-    list.append(&section_card(
-        "Includes",
-        &[
-            format!("node files = {}", project.file.includes.nodes.join(", ")),
-            format!("scripts = {}", project.file.includes.scripts.join(", ")),
-            format!("configs = {}", project.file.includes.configs.join(", ")),
-            format!("assets = {}", project.file.includes.assets.join(", ")),
-        ],
-    ));
-    list.append(&section_card(
-        "VM Setup",
-        &[
-            format!("base image = {}", recipe.vm.base_image),
-            format!("os family = {}", recipe.vm.os_family),
-            format!("ram = {} MiB", recipe.vm.ram_mb),
-            format!("cpu cores = {}", recipe.vm.cpu_cores),
-        ],
-    ));
-    list.append(&section_card(
-        "Topology",
-        &recipe
-            .topology
-            .attachments
-            .iter()
-            .map(|attachment| format!("{} -> {}", attachment.element_id, attachment.network_id))
-            .collect::<Vec<_>>(),
-    ));
+    populate_recipe(&list, &project, &recipe);
+    let weak = list.downgrade();
+    let subscription = RUNTIME_CONTROLLER.with(|controller| {
+        controller.subscribe(Rc::new(move |snapshot| {
+            if let (Some(list), Some(project), Some(recipe)) = (
+                weak.upgrade(),
+                snapshot.project.as_ref(),
+                snapshot.recipe.as_ref(),
+            ) {
+                populate_recipe(&list, project, recipe);
+            }
+        }))
+    });
+    unsafe {
+        root.set_data("sim-rns-recipe-subscription", subscription);
+    }
 
     // The shell supplies the scrolling viewport for plugin pages.
     root.append(&list);
@@ -1460,3 +1449,44 @@ extern "C" fn create_templates_view(
 }
 
 export_plugin!(SimRnsPlugin);
+
+fn populate_recipe(list: &ListBox, project: &Project, recipe: &Recipe) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    list.append(&section_card(
+        "Metadata",
+        &[
+            format!("id = {}", recipe.metadata.id),
+            format!("name = {}", recipe.metadata.name),
+            format!("description = {}", recipe.metadata.description),
+        ],
+    ));
+    list.append(&section_card(
+        "Includes",
+        &[
+            format!("node files = {}", project.file.includes.nodes.join(", ")),
+            format!("scripts = {}", project.file.includes.scripts.join(", ")),
+            format!("configs = {}", project.file.includes.configs.join(", ")),
+            format!("assets = {}", project.file.includes.assets.join(", ")),
+        ],
+    ));
+    list.append(&section_card(
+        "VM Setup",
+        &[
+            format!("base image = {}", recipe.vm.base_image),
+            format!("os family = {}", recipe.vm.os_family),
+            format!("ram = {} MiB", recipe.vm.ram_mb),
+            format!("cpu cores = {}", recipe.vm.cpu_cores),
+        ],
+    ));
+    list.append(&section_card(
+        "Topology",
+        &recipe
+            .topology
+            .attachments
+            .iter()
+            .map(|attachment| format!("{} -> {}", attachment.element_id, attachment.network_id))
+            .collect::<Vec<_>>(),
+    ));
+}

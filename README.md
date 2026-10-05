@@ -73,6 +73,14 @@ In the launcher, choose **Create New Project**, enter a name and destination, an
 
 Existing projects are unchanged. Their `vm.base_image` may be a guest-bundle directory or bootable image path; relative paths resolve against the project root. A blank image is not silently created.
 
+## Edit a simulation
+
+Open the **Nodes** tab while the VM is stopped. **Add Node / LAN** offers Python Reticulum, virtual LAN, Python script, and Bash script templates. Use **Edit** to change enabled state, LAN connections, environment variables, memory limits, CPU weight, restart policy, and command arguments. Script nodes accept Python/Bash source directly; existing project scripts have their own editor below the node list. Existing node IDs are fixed; create a new node to use a different ID.
+
+Saving checks the whole recipe and rejects stale forms if another operation changed the project. Removing a LAN disconnects its nodes; removed node source files are retained. Running and paused simulations cannot be edited.
+
+For a previously prepared VM, select **Start a fresh guest on next Run** before saving a configuration change. The old VM directory is preserved under `.sim-rns/previous-vm-*`, and the next Run prepares a new guest from the project bundle. The new guest has new identities and guest files. Backups consume disk space and are not removed automatically. Source edits do not live-update an initialized guest. This editor does not rename nodes or edit asset mappings and VM settings.
+
 ## End-to-end verification
 
 ```sh
@@ -86,7 +94,7 @@ This boots a temporary project, verifies packet reception by both Reticulum node
 
 - QMP responses and process identity are verified; an unresponsive control channel returns an error and retains process tracking. The app never kills a process using an unverified numeric PID. Legacy numeric PID files require manually stopping the old VM before removing the stale tracking file.
 - Runtime commands are serialized by a per-project filesystem lock; metadata is replaced atomically. Status polling does not rewrite runtime metadata. Readers of externally edited project files still require valid JSON.
-- Guest initialization is persistent. Editing the initialization recipe of an existing guest requires a fresh project; reboot preserves its files and identities and reruns the startup sequence. Resume preserves the paused execution state.
+- Guest initialization is persistent. Editing an initialized guest requires a fresh guest disk; the Nodes editor can archive the old VM with explicit consent. Normal reboot preserves its files and identities and reruns the startup sequence. Resume preserves the paused execution state.
 - Guest-supported templates are `network.lan`, `reticulum.python.backbone`, `script.python`, and `script.bash`. Asset seeds are copied; template rendering, Rust/LXMF runtimes, and arbitrary custom templates are not implemented.
-- VM snapshots, live topology mutation, SSH projects, slowdown, and recipe editing UI remain unimplemented. Unsupported QEMU commands return errors instead of updating pretend state. `FileBackedRuntime` is a metadata-only test model.
+- VM snapshots, live topology mutation, SSH projects, slowdown, and full recipe/asset editing remain unimplemented. Unsupported QEMU commands return errors instead of updating pretend state. `FileBackedRuntime` is a metadata-only test model.
 - The serial control protocol is versioned and request-correlated. It is project-local, with no network listener. Logs are currently local files with bounded UI tails; disk log rotation is not implemented.

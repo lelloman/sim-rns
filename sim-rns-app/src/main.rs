@@ -72,6 +72,14 @@ fn main() {
                 false,
             ),
             plugin_tab(
+                "nodes",
+                "workbench-main",
+                "Nodes",
+                "com.lelloman.sim_rns.nodes",
+                "The node editor could not be created.",
+                false,
+            ),
+            plugin_tab(
                 "recipe",
                 "workbench-main",
                 "Recipe",
@@ -89,6 +97,8 @@ fn main() {
             ),
         ],
     ));
+
+    migrate_nodes_tab(&product.shell_spec());
 
     let launcher = LauncherSpec::new(
         "Sim RNS",
@@ -369,4 +379,52 @@ fn project_session_path() -> Option<std::path::PathBuf> {
                 .join("sim-rns")
                 .join("session.json")
         })
+}
+
+// Introduce the editor into existing layouts without resetting user tab arrangements.
+fn migrate_nodes_tab(default: &maruzzella::spec::ShellSpec) {
+    use maruzzella::layout;
+    fn contains(node: &WorkbenchNodeSpec) -> bool {
+        match node {
+            WorkbenchNodeSpec::Group(g) => g.tabs.iter().any(|t| t.id == "nodes"),
+            WorkbenchNodeSpec::Split { children, .. } => children.iter().any(contains),
+        }
+    }
+    fn insert(node: &mut WorkbenchNodeSpec) -> bool {
+        match node {
+            WorkbenchNodeSpec::Group(g) => {
+                g.tabs.push(plugin_tab(
+                    "nodes",
+                    &g.id,
+                    "Nodes",
+                    "com.lelloman.sim_rns.nodes",
+                    "The node editor could not be created.",
+                    false,
+                ));
+                true
+            }
+            WorkbenchNodeSpec::Split { children, .. } => children.iter_mut().any(insert),
+        }
+    }
+    if !layout::path_for_slot("sim-rns", "workspace").exists() && !layout::path("sim-rns").exists()
+    {
+        return;
+    }
+    let mut saved = layout::load_for_slot("sim-rns", "workspace", default);
+    if contains(&saved.spec.workbench)
+        || saved
+            .detached_workbenches
+            .iter()
+            .any(|w| contains(&w.workbench))
+    {
+        return;
+    }
+    if insert(&mut saved.spec.workbench) {
+        if let Err(e) = layout::try_save(
+            &layout::scoped_persistence_id("sim-rns", "workspace"),
+            &saved,
+        ) {
+            eprintln!("sim-rns: could not add Nodes to saved layout: {e}");
+        }
+    }
 }
