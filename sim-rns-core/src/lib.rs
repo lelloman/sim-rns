@@ -256,6 +256,8 @@ impl Project {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LauncherConfig {
     #[serde(default)]
+    pub last_guest_bundle: Option<String>,
+    #[serde(default)]
     pub recent_projects: Vec<ProjectHandle>,
 }
 
@@ -420,41 +422,72 @@ pub fn write_project_source(
     }
 }
 
-/// Create a runnable Python Reticulum demo from a built guest bundle.
+/// Validate the manifest and every image before creating a project or importing a VM.
+pub fn validate_guest_bundle(path: impl AsRef<Path>) -> Result<PathBuf, String> {
+    let root = std::fs::canonicalize(path.as_ref())
+        .map_err(|e| format!("Cannot open guest bundle: {e}"))?;
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("guest.json"))
+            .map_err(|e| format!("Choose a guest bundle directory containing guest.json: {e}"))?,
+    )
+    .map_err(|e| format!("Invalid guest.json: {e}"))?;
+    if manifest["version"] != 1 {
+        return Err("Unsupported guest bundle version (expected 1)".into());
+    }
+    for field in ["kernel", "initrd", "disk"] {
+        let relative = manifest[field]
+            .as_str()
+            .ok_or_else(|| format!("Guest bundle is missing {field}"))?;
+        let file = resolve_project_relative_path(&root, relative)?;
+        let metadata = std::fs::File::open(&file)
+            .and_then(|f| f.metadata())
+            .map_err(|e| format!("Cannot read {field}: {e}"))?;
+        if metadata.len() == 0 {
+            return Err(format!("Guest bundle {field} file is empty"));
+        }
+    }
+    let disk = resolve_project_relative_path(&root, manifest["disk"].as_str().unwrap())?;
+    let output = std::process::Command::new("qemu-img")
+        .args(["info", "--output=json"])
+        .arg(disk)
+        .output()
+        .map_err(|e| format!("Cannot validate the guest disk; install qemu-img: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Invalid guest disk: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let info: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
+    if info["virtual-size"].as_u64().unwrap_or(0) == 0 {
+        return Err("Guest disk is empty".into());
+    }
+    Ok(root)
+}
+
+/// Create the supported two-node configuration using a validated guest bundle.
+pub fn create_project_with_bundle(
+    path: impl AsRef<Path>,
+    name: &str,
+    bundle: impl AsRef<Path>,
+) -> Result<Project, String> {
+    let bundle = validate_guest_bundle(bundle)?;
+    let mut project = create_project(path, name)?;
+    project.file.vm.base_image = bundle.to_string_lossy().into_owned();
+    write_project_file(&project)?;
+    load_project(&project.root_path)
+}
+
+/// Compatibility helper for the original demo command.
 pub fn create_demo_project(
     path: impl AsRef<Path>,
     bundle: impl AsRef<Path>,
 ) -> Result<Project, String> {
-    let image = std::fs::canonicalize(bundle.as_ref()).map_err(|e| e.to_string())?;
-    let mut project = create_project(path, "Reticulum Guest Demo")?;
-    project.file.vm.base_image = image.to_string_lossy().into_owned();
-    project.file.vm.ram_mb = 512;
-    project.file.vm.cpu_cores = 1;
-    for filename in ["backbone-a.node.json", "phone-a.node.json"] {
-        let path = project.root_path.join("nodes").join(filename);
-        let mut node: ProjectNodeFile =
-            serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
-        node.template_id = "reticulum.python.backbone".into();
-        for asset in &mut node.assets {
-            asset.mode = AssetMode::Copy;
-        }
-        node.resources = Some(ResourceLimits {
-            memory_mb: 256,
-            cpu_weight: 100,
-        });
-        persistence::atomic_write(
-            &path,
-            &serde_json::to_vec_pretty(&node).map_err(|e| e.to_string())?,
-        )?;
-    }
-    persistence::atomic_write(
-        &project_file_path(&project.root_path),
-        &serde_json::to_vec_pretty(&project.file).map_err(|e| e.to_string())?,
-    )?;
-    load_project(&project.root_path)
+    create_project_with_bundle(path, "Reticulum Guest Demo", bundle)
 }
 
+/// Low-level source scaffold; user-facing creation must use create_project_with_bundle.
 pub fn create_project(root_path: impl AsRef<Path>, name: &str) -> Result<Project, String> {
     let requested_root = root_path.as_ref();
     let trimmed_name = name.trim();
@@ -486,14 +519,14 @@ pub fn create_project(root_path: impl AsRef<Path>, name: &str) -> Result<Project
         schema_version: PROJECT_SCHEMA_VERSION,
         project_id: project_id.clone(),
         name: trimmed_name.to_string(),
-        description: "Local sim-rns project scaffold".to_string(),
+        description: "Two Python Reticulum nodes connected over a virtual LAN".to_string(),
         created_at_unix_ms: timestamp,
         updated_at_unix_ms: timestamp,
         vm: VmSetup {
             base_image: "sim-rns-guest-v1".to_string(),
             os_family: "debian".to_string(),
-            ram_mb: 4096,
-            cpu_cores: 4,
+            ram_mb: 512,
+            cpu_cores: 1,
         },
         includes: ProjectIncludes {
             configs: vec!["configs/backbone-a.toml".to_string()],
@@ -570,13 +603,13 @@ fn write_project_scaffold_files(root_path: &Path, project_id: &str) -> Result<()
             .join("backbone-a.node.json"),
         &ProjectNodeFile {
             id: "backbone-a".to_string(),
-            template_id: "rns.rs.backbone".to_string(),
+            template_id: "reticulum.python.backbone".to_string(),
             enabled: true,
             env: BTreeMap::from([("RNS_INSTANCE".to_string(), "backbone-a".to_string())]),
             assets: vec![AssetSeed {
                 source: "configs/backbone-a.toml".to_string(),
                 destination: "config/config.toml".to_string(),
-                mode: AssetMode::Template,
+                mode: AssetMode::Copy,
             }],
             restart_policy: None,
             resources: None,
@@ -588,14 +621,14 @@ fn write_project_scaffold_files(root_path: &Path, project_id: &str) -> Result<()
         root_path.join(PROJECT_NODES_DIR).join("phone-a.node.json"),
         &ProjectNodeFile {
             id: "phone-a".to_string(),
-            template_id: "custom.phone".to_string(),
+            template_id: "reticulum.python.backbone".to_string(),
             enabled: true,
-            env: BTreeMap::from([("LXMF_DISPLAY_NAME".to_string(), "phone-a".to_string())]),
+            env: BTreeMap::from([("RNS_INSTANCE".to_string(), "phone-a".to_string())]),
             assets: Vec::new(),
             restart_policy: Some(RestartPolicy::OnFailure),
             resources: Some(ResourceLimits {
-                memory_mb: 160,
-                cpu_weight: 70,
+                memory_mb: 256,
+                cpu_weight: 100,
             }),
             command_override: None,
             attachments: vec!["lan-main".to_string()],
@@ -1007,7 +1040,7 @@ pub fn add_node_include(project_root: impl AsRef<Path>) -> Result<(Project, Stri
         absolute_path,
         &ProjectNodeFile {
             id: node_id.clone(),
-            template_id: "rns.rs.backbone".to_string(),
+            template_id: "reticulum.python.backbone".to_string(),
             enabled: true,
             env: BTreeMap::from([("RNS_INSTANCE".to_string(), node_id.clone())]),
             assets: Vec::new(),

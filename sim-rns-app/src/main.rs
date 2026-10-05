@@ -33,9 +33,13 @@ fn main() {
     let restored_project = load_saved_project_session();
     let mut product = default_product_spec();
     product.branding.title = "Sim RNS".to_string();
-    product.branding.status_text =
-        "Selected local project loaded into the simulator scaffold".to_string();
+    product.branding.status_text = "Local Reticulum simulator".to_string();
     product.include_base_toolbar_items = false;
+    product.include_base_startup_tabs = false;
+    product.layout.left_panel = TabGroupSpec::new("left", None, vec![]);
+    product.layout.right_panel = TabGroupSpec::new("right", None, vec![]);
+    product.layout.bottom_panel = TabGroupSpec::new("bottom", None, vec![]);
+
     product.menu_roots = root_menu_roots();
     product.menu_items = root_menu_items();
     // Register every menu command explicitly so the shell installs a discoverable

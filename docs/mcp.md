@@ -12,7 +12,9 @@ Build with `cargo build --workspace --locked`. Point a stdio MCP client at the a
 }
 ```
 
-The MCP process and GTK application are separate. `launch` starts `sim-rns-app` alongside the MCP executable, inheriting its desktop environment, or attaches if the app is already running. You can also start `sim-rns-app` yourself. Closing an MCP connection leaves the app and simulation running. Use `runtime.shutdown` before `app.quit` when you want to stop both; quitting or closing a project does not shut down its VM.
+The MCP process and GTK application are separate. `launch` starts `sim-rns-app` alongside the MCP executable, inheriting its desktop environment or recovering display variables from a same-user desktop session, or attaches if the app is already running. You can also start `sim-rns-app` yourself. Closing an MCP connection leaves the app and simulation running. Use `runtime.shutdown` before `app.quit` when you want to stop both; quitting or closing a project does not shut down its VM.
+
+If multiple desktop sessions are found, set `DISPLAY` / `WAYLAND_DISPLAY` explicitly in the MCP environment. Launch reports early exit diagnostics and stops an unready child after 15 seconds.
 
 ## Tools
 
@@ -31,7 +33,7 @@ Project and runtime tools target the active project in the app. `project.inspect
 To create a runnable example after building a guest bundle:
 
 ```json
-{"operation":"create_demo","path":"/tmp/my-simulation","bundle":"/absolute/path/to/guest-bundle"}
+{"operation":"create","name":"My simulation","path":"/tmp/my-simulation","bundle":"/absolute/path/to/guest-bundle"}
 ```
 
 Then call `runtime` with:
@@ -46,7 +48,7 @@ Then call `runtime` with:
 {"operation":"shutdown"}
 ```
 
-`project.create` makes the generic scaffold, with the same current template limitations as the GUI. `create_demo` produces the supported Python Reticulum configuration.
+`project.create` requires a `bundle` directory and validates it before creating files. Both it and the GUI produce supported Python Reticulum nodes with a virtual LAN. `create_demo` remains a compatibility shortcut with a fixed name.
 
 ## UI control
 
@@ -67,7 +69,7 @@ These IDs are examples, not constants. IDs are tied to widget lifetime; refresh 
 
 ## Local connection and behavior
 
-The app listens on `$XDG_RUNTIME_DIR/sim-rns/control.sock`, falling back to `$HOME/.cache/sim-rns/control.sock`. Override it with `SIM_RNS_CONTROL_SOCKET` on both processes, or pass `--socket /path/to/control.sock` to the MCP server. `launch` passes the selected socket to the child app. The parent directory must be owned by the current user and have mode `0700`; the socket has mode `0600`. A file lock prevents a second app from replacing a live endpoint, and a new owner cleans stale sockets after a crash. This endpoint grants full app control to local processes running as that user.
+The app listens on `$XDG_RUNTIME_DIR/sim-rns/control.sock`, using a securely owned `/run/user/<uid>` when that variable is absent, then falling back to `$HOME/.cache/sim-rns/control.sock`. An existing legacy cache socket is retained when the preferred endpoint is absent. Override it with `SIM_RNS_CONTROL_SOCKET` on both processes, or pass `--socket /path/to/control.sock` to the MCP server. `launch` passes the selected socket to the child app. The parent directory must be owned by the current user and have mode `0700`; the socket has mode `0600`. A file lock prevents a second app from replacing a live endpoint, and a new owner cleans stale sockets after a crash. This endpoint grants full app control to local processes running as that user.
 
 GTK work runs on the main thread. Project I/O and QEMU operations run on workers using the same busy state as the toolbar. Concurrent UI inspection remains available during VM boot. Project switching and conflicting runtime operations are rejected while work is in progress. Calls time out after about three minutes; a timeout or client cancellation does not undo work already dispatched. Inspect state before retrying mutations.
 
@@ -83,9 +85,10 @@ Snapshots and live topology changes remain unsupported by the QEMU backend. Thei
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --workspace --locked
+python3 scripts/test-mcp-launch.py
 xvfb-run -a dbus-run-session -- python3 scripts/test-mcp.py
 xvfb-run -a dbus-run-session -- python3 scripts/test-mcp.py \
   --guest-bundle /absolute/path/to/guest-bundle
 ```
 
-The integration test uses real stdio MCP messages, an isolated configuration directory and a private GTK display/session. It checks discovery, invalid arguments, launch/attach, project operations, file rollback, UI tabs, text editing, screenshots and error propagation. With a guest bundle it also checks real VM/node control, Reticulum packet exchange and UI responsiveness during boot.
+The integration test uses real stdio MCP messages, an isolated configuration directory and a private GTK display/session. It checks discovery, invalid arguments, launch/attach, project operations, file rollback, UI tabs, text editing, screenshots and error propagation. It also checks the new-project form, invalid-bundle rejection, and workspace sizing. QEMU image tools are required even without a bootable bundle. With a guest bundle it boots an ordinary GUI-created project and checks real VM/node control, Reticulum packet exchange and UI responsiveness during boot. To test desktop recovery on a real desktop, run `dbus-run-session -- python3 scripts/test-mcp.py --filtered-launch` without Xvfb. The separate launch test checks early exit diagnostics and the startup timeout.

@@ -15,6 +15,8 @@ import time
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--guest-bundle", type=Path)
+    parser.add_argument("--filtered-launch", action="store_true")
+    parser.add_argument("--screenshot", type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     with tempfile.TemporaryDirectory(prefix="sim-rns-mcp-") as directory:
@@ -25,8 +27,19 @@ def main():
                    XDG_CACHE_HOME=str(work / "cache"), XDG_RUNTIME_DIR=str(runtime),
                    SIM_RNS_CONTROL_SOCKET=str(runtime / "control.sock"),
                    GSK_RENDERER="cairo", GTK_A11Y="none")
+        bundle = args.guest_bundle.resolve() if args.guest_bundle else work / "fixture-bundle"
+        if not args.guest_bundle:
+            bundle.mkdir()
+            (bundle / "guest.json").write_text(json.dumps(dict(version=1, kernel="vmlinuz", initrd="initrd.gz", disk="base.qcow2")))
+            (bundle / "vmlinuz").write_text("fixture kernel")
+            (bundle / "initrd.gz").write_text("fixture initramfs")
+            subprocess.run(["qemu-img", "create", "-f", "qcow2", bundle / "base.qcow2", "16M"], check=True, stdout=subprocess.DEVNULL)
         with (work / "stderr.log").open("w+") as log:
-            server = subprocess.Popen([root / "target/debug/sim-rns-mcp"], env=env,
+            mcp_env = env.copy()
+            if args.filtered_launch:
+                for key in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR"]:
+                    mcp_env.pop(key, None)
+            server = subprocess.Popen([root / "target/debug/sim-rns-mcp"], env=mcp_env,
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=log, text=True, bufsize=1)
             sequence = 0
@@ -69,6 +82,46 @@ def main():
                         yield from walk(child)
                 return [item for window in tool("ui", "tree")["windows"] for item in walk(window)]
 
+            def close_in_ui():
+                tool("project", "close")
+                time.sleep(.1)
+                switch = next((item for item in widgets() if item.get("label") == "Switch" and item["mapped"]), None)
+                if switch:
+                    tool("ui", "activate", widget_id=switch["id"])
+
+            def create_in_ui(destination, name, check_invalid=False):
+                close_in_ui()
+                deadline = time.monotonic() + 5
+                while True:
+                    button = next((item for item in widgets() if item.get("label") == "Create New Project" and item["mapped"]), None)
+                    if button:
+                        break
+                    assert time.monotonic() < deadline, "launcher did not appear"
+                    time.sleep(.1)
+                tool("ui", "activate", widget_id=button["id"])
+                fields = {item["name"]: item["id"] for item in widgets() if item["name"].startswith("new-project-")}
+                tool("ui", "set_text", widget_id=fields["new-project-name"], text=name)
+                tool("ui", "set_text", widget_id=fields["new-project-path"], text=str(destination))
+                create = next(item for item in widgets() if item.get("label") == "Create Simulation" and item["mapped"])
+                if check_invalid:
+                    tool("ui", "set_text", widget_id=fields["new-project-bundle"], text=str(work / "missing-bundle"))
+                    tool("ui", "activate", widget_id=create["id"])
+                    deadline = time.monotonic() + 10
+                    while tool("app", "state")["runtime_busy"]:
+                        assert time.monotonic() < deadline
+                        time.sleep(.1)
+                    assert not destination.exists(), "invalid bundle created project files"
+                    assert any("Cannot open guest bundle" in item.get("text", "") and item["mapped"] for item in widgets())
+                tool("ui", "set_text", widget_id=fields["new-project-bundle"], text=str(bundle))
+                tool("ui", "activate", widget_id=create["id"])
+                deadline = time.monotonic() + 10
+                while True:
+                    state = tool("app", "state")
+                    if state["project"] and state["project"]["path"] == str(destination):
+                        break
+                    assert time.monotonic() < deadline, state
+                    time.sleep(.1)
+
             try:
                 response = rpc("initialize", dict(protocolVersion="2025-11-25", capabilities={}, clientInfo=dict(name="integration-test", version="1")))
                 assert response["result"]["capabilities"]["tools"] is not None
@@ -83,20 +136,27 @@ def main():
                 assert tool("launch")["pid"] == state["pid"]
                 time.sleep(0.3)
                 project = work / "project"
-                tool("project", "create", path=str(project), name="MCP Integration")
+                tool("project", "create", path=str(project), name="MCP Integration", bundle=str(bundle))
+                project = work / "gui-project"
+                create_in_ui(project, "MCP Integration", check_invalid=True)
                 assert tool("app", "state")["project"]["path"] == str(project)
                 assert tool("project", "inspect")["recipe"]["metadata"]["name"] == "MCP Integration"
                 time.sleep(0.3)
                 tree = widgets()
                 window = next(item for item in tree if "commands" in item and item["mapped"])
+                assert not any(item.get("text") in ["Workspace", "Activity"] and "tab-label" in item["css_classes"] for item in tree)
                 # Invoke the actual tab-header gesture and verify both shell style and page.
                 header = next(item for item in tree if "tab-header" in item["css_classes"] and any(c.get("text") == "Recipe" for c in item.get("children", [])))
                 tool("ui", "activate", widget_id=header["id"])
                 tree = widgets()
                 assert "active" in next(item for item in tree if item["id"] == header["id"])["css_classes"]
                 assert any(item.get("visible_child") == "custom-workbench-page:recipe" for item in tree)
+                content_scrolls = [item for item in tree if item["type"] == "GtkScrolledWindow" and item["mapped"] and item["bounds"]["height"] > 40]
+                assert len(content_scrolls) == 1 and content_scrolls[0]["bounds"]["height"] > 300, content_scrolls
                 shot = tool("ui", "screenshot", window_id=window["id"])
                 assert shot["type"] == "image" and base64.b64decode(shot["data"]).startswith(b"\x89PNG")
+                if args.screenshot:
+                    args.screenshot.write_bytes(base64.b64decode(shot["data"]))
                 # Reorder tabs through the shell's drag controller and exercise its context menu.
                 first = next(item for item in tree if "tab-header" in item["css_classes"] and any(c.get("text") == "Overview" for c in item.get("children", [])))
                 offset = first["bounds"]["x"] + first["bounds"]["width"] / 4 - header["bounds"]["x"] - 5
@@ -138,13 +198,13 @@ def main():
                 tool("project", "read_file", path=".sim-rns/runtime-state.json", error=True)
                 assert tool("runtime", "status")["vm_state"] == "stopped"
                 tool("runtime", "create_snapshot", name="unsupported", error=True)
-                tool("project", "close")
+                close_in_ui()
                 assert tool("app", "state")["project"] is None
                 tool("runtime", "status", error=True)
                 tool("project", "open", path=str(project))
                 if args.guest_bundle:
                     demo = work / "demo"
-                    tool("project", "create_demo", path=str(demo), bundle=str(args.guest_bundle.resolve()))
+                    create_in_ui(demo, "Ordinary runnable project")
                     # Submit a long-running boot and a UI request concurrently over MCP.
                     sequence += 1
                     boot_id = sequence

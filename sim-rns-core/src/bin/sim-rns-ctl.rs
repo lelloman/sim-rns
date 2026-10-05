@@ -10,13 +10,19 @@ fn main() {
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() < 2 {
-        return Err("usage: sim-rns-ctl <create-demo|status|boot|pause|resume|stop|start-node|stop-node|restart-node> PROJECT [IMAGE_BUNDLE|ELEMENT_ID]".into());
+        return Err("usage: sim-rns-ctl <create|create-demo|status|boot|pause|resume|stop|start-node|stop-node|restart-node> PROJECT [IMAGE_BUNDLE|ELEMENT_ID]".into());
     }
-    if args[0] == "create-demo" {
-        let image = args
-            .get(2)
-            .ok_or("create-demo requires a guest image bundle")?;
-        let project = create_demo_project(&args[1], image)?;
+    if args[0] == "create-demo" || args[0] == "create" {
+        let image = args.get(2).ok_or("create requires a guest image bundle")?;
+        let name = args
+            .get(3)
+            .map(String::as_str)
+            .unwrap_or("Reticulum Simulation");
+        let project = if args[0] == "create-demo" {
+            create_demo_project(&args[1], image)?
+        } else {
+            create_project_with_bundle(&args[1], name, image)?
+        };
         println!("{}", project.root_path.display());
         return Ok(());
     }

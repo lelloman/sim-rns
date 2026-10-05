@@ -206,8 +206,8 @@ fn project_work(
                 Transition::Open(handle),
             ))
         }
-        ProjectRequest::Create { path, name } => {
-            let project = create_project(path, &name)?;
+        ProjectRequest::Create { path, name, bundle } => {
+            let project = create_project_with_bundle(path, &name, bundle)?;
             let handle = ProjectHandle::for_local_dir(&project.root_path)?;
             Ok((
                 json!({"path": project.root_path, "project":project.file}),

@@ -35,39 +35,81 @@ impl Server {
 #[tool_router]
 impl Server {
     #[tool(
-        description = "Start the local Sim RNS GUI, or attach if it is already running. Launches sim-rns-app next to this binary, inheriting the desktop display environment. Waits until its control endpoint is ready."
+        description = "Start the local Sim RNS GUI, or attach if it is already running. Launches sim-rns-app next to this binary, using the desktop display environment or discovering the current user’s desktop session. Waits until its control endpoint is ready."
     )]
     async fn launch(&self) -> CallToolResult {
         let socket = self.socket.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            if call(&socket, &Request::App(AppRequest::State)).is_ok() {
+            let ready = || {
+                call_with_timeout(
+                    &socket,
+                    &Request::App(AppRequest::State),
+                    std::time::Duration::from_millis(300),
+                )
+                .is_ok()
+            };
+            if ready() {
                 return Ok(());
             }
             let executable = std::env::current_exe()
                 .map_err(|e| e.to_string())?
                 .with_file_name("sim-rns-app");
+            let desktop = desktop_environment()?;
             let mut child = std::process::Command::new(executable)
+                .envs(desktop)
                 .env("SIM_RNS_CONTROL_SOCKET", &socket)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::piped())
                 .spawn()
                 .map_err(|e| {
-                    format!("failed to launch app: {e}; build sim-rns-app alongside sim-rns-mcp")
+                    format!("Failed to launch app: {e}; build sim-rns-app alongside sim-rns-mcp")
                 })?;
-            std::thread::spawn(move || {
-                let _ = child.wait();
+            let diagnostics = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let tail = diagnostics.clone();
+            let mut stderr = child.stderr.take().unwrap();
+            let reader = std::thread::spawn(move || {
+                use std::io::Read;
+                let mut buffer = [0u8; 1024];
+                while let Ok(n) = stderr.read(&mut buffer) {
+                    if n == 0 {
+                        break;
+                    }
+                    eprint!("{}", String::from_utf8_lossy(&buffer[..n]));
+                    let mut tail = tail.lock().unwrap();
+                    tail.extend_from_slice(&buffer[..n]);
+                    let excess = tail.len().saturating_sub(8192);
+                    tail.drain(..excess);
+                }
             });
-            for _ in 0..100 {
-                if call(&socket, &Request::App(AppRequest::State)).is_ok() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if ready() {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                        let _ = reader.join();
+                    });
                     return Ok(());
+                }
+                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                    let _ = reader.join();
+                    return Err(format!(
+                        "App exited ({status}) before its control endpoint was ready: {}",
+                        String::from_utf8_lossy(&diagnostics.lock().unwrap()).trim()
+                    ));
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return Err(format!(
+                        "App startup timed out at {}: {}",
+                        socket.display(),
+                        String::from_utf8_lossy(&diagnostics.lock().unwrap()).trim()
+                    ));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            Err(
-                "app did not become ready; inspect stderr and the desktop display environment"
-                    .into(),
-            )
         })
         .await;
         match result {
@@ -83,7 +125,7 @@ impl Server {
         self.forward(Request::App(request)).await
     }
     #[tool(
-        description = "Create/open/close/inspect projects, add node/script includes, and read/write project source files. Mutations require an idle app; write_file requires a stopped VM and rolls back invalid recipes. Paths for file operations are relative to the active project."
+        description = "Create/open/close/inspect projects, add node/script includes, and read/write project source files. Create requires a validated guest bundle. Mutations require an idle app; write_file requires a stopped VM and rolls back invalid recipes. Paths for file operations are relative to the active project."
     )]
     async fn project(&self, Parameters(request): Parameters<ProjectRequest>) -> CallToolResult {
         self.forward(Request::Project(request)).await

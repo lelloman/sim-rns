@@ -17,6 +17,60 @@ fn project(label: &str) -> Project {
 }
 
 #[test]
+fn default_nodes_and_new_includes_use_supported_guest_templates() {
+    let p = project("supported-defaults");
+    let (p, _) = add_node_include(&p.root_path).unwrap();
+    let recipe = project_recipe(&p).unwrap();
+    assert_eq!(p.file.vm.ram_mb, 512);
+    assert_eq!(p.file.vm.cpu_cores, 1);
+    for element in recipe.elements {
+        assert!([
+            "network.lan",
+            "reticulum.python.backbone",
+            "script.python",
+            "script.bash"
+        ]
+        .contains(&element.template_id.as_str()));
+        assert!(element
+            .assets
+            .iter()
+            .all(|asset| asset.mode == AssetMode::Copy));
+    }
+    std::fs::remove_dir_all(p.root_path).unwrap();
+}
+
+#[test]
+fn invalid_bundles_are_rejected_before_project_creation() {
+    let p = project("bundle-validation");
+    let bundle = p.root_path.join("bundle");
+    std::fs::create_dir(&bundle).unwrap();
+    let target = p.root_path.join("new-project");
+    let manifest =
+        serde_json::json!({"version":1,"kernel":"kernel","initrd":"initrd","disk":"disk"});
+    for bytes in [
+        b"not json".to_vec(),
+        serde_json::to_vec(&serde_json::json!({"version":2})).unwrap(),
+        serde_json::to_vec(&manifest).unwrap(),
+    ] {
+        std::fs::write(bundle.join("guest.json"), bytes).unwrap();
+        assert!(create_project_with_bundle(&target, "Test", &bundle).is_err());
+        assert!(!target.exists());
+    }
+    std::fs::write(bundle.join("kernel"), "kernel").unwrap();
+    std::fs::write(bundle.join("initrd"), "").unwrap();
+    assert!(validate_guest_bundle(&bundle)
+        .unwrap_err()
+        .contains("empty"));
+    std::fs::remove_file(bundle.join("kernel")).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", bundle.join("kernel")).unwrap();
+    assert!(validate_guest_bundle(&bundle)
+        .unwrap_err()
+        .contains("inside"));
+    assert!(!target.exists());
+    std::fs::remove_dir_all(p.root_path).unwrap();
+}
+
+#[test]
 fn source_edits_validate_rollback_and_confine_paths() {
     let p = project("source-edit");
     let original = read_project_source(&p.root_path, PROJECT_FILE_NAME).unwrap();

@@ -17,9 +17,9 @@ use maruzzella_sdk::{
     SurfaceContributionSpec, Version, ViewFactorySpec,
 };
 use sim_rns_core::{
-    close_project, create_project, current_project, current_project_handle, load_project,
-    open_project, project_recipe, Element, LauncherConfig, Project, ProjectHandle, ProjectRuntime,
-    QemuRuntime, Recipe, RuntimeCommand, RuntimeStatus, RuntimeVmState, Template,
+    close_project, create_project_with_bundle, current_project, current_project_handle,
+    load_project, open_project, project_recipe, Element, LauncherConfig, Project, ProjectHandle,
+    ProjectRuntime, QemuRuntime, Recipe, RuntimeCommand, RuntimeStatus, RuntimeVmState, Template,
 };
 
 use runtime_store::{RuntimeController, RuntimeOperation, RuntimeViewSnapshot};
@@ -331,6 +331,8 @@ fn run_runtime_command_for_handle(
 
 fn build_root(title: &str, subtitle: &str) -> GtkBox {
     let root = GtkBox::new(Orientation::Vertical, 12);
+    root.set_vexpand(true);
+    root.set_hexpand(true);
     root.set_margin_top(18);
     root.set_margin_bottom(18);
     root.set_margin_start(18);
@@ -357,6 +359,168 @@ fn workspace_error_label() -> Label {
     label.add_css_class("error");
     label.set_visible(false);
     label
+}
+
+fn show_new_project_dialog(parent: Option<&gtk::Window>, host: maruzzella_sdk::ffi::MzHostApi) {
+    let window = gtk::Window::builder()
+        .title("New Simulation")
+        .default_width(620)
+        .modal(true)
+        .build();
+    window.set_transient_for(parent);
+    if let Some(app) = parent.and_then(|p| p.application()) {
+        window.set_application(Some(&app));
+    }
+    let form = build_root(
+        "New Simulation",
+        "Start with two Python Reticulum nodes connected over a virtual LAN.",
+    );
+    let name = gtk::Entry::builder()
+        .text("My simulation")
+        .hexpand(true)
+        .build();
+    name.set_widget_name("new-project-name");
+    let path = gtk::Entry::builder()
+        .text(
+            home_dir_or_root()
+                .join("sim-rns-projects/my-simulation")
+                .to_string_lossy(),
+        )
+        .hexpand(true)
+        .build();
+    path.set_widget_name("new-project-path");
+    let bundle = gtk::Entry::builder().hexpand(true).build();
+    bundle.set_widget_name("new-project-bundle");
+    if let Some(saved) = load_config(&host)
+        .last_guest_bundle
+        .or_else(|| std::env::var("SIM_RNS_GUEST_BUNDLE").ok())
+    {
+        bundle.set_text(&saved);
+    }
+    for (label, entry, browse) in [
+        ("Name", &name, false),
+        ("Project directory (new or empty)", &path, true),
+        ("Guest bundle", &bundle, true),
+    ] {
+        let heading = Label::new(Some(label));
+        heading.set_xalign(0.0);
+        form.append(&heading);
+        let row = GtkBox::new(Orientation::Horizontal, 8);
+        row.append(entry);
+        if browse {
+            let button = Button::with_label("Browse…");
+            let entry = entry.downgrade();
+            let parent = window.downgrade();
+            button.connect_clicked(move |_| {
+                let entry = entry.clone();
+                prompt_directory_picker(
+                    parent.upgrade().as_ref(),
+                    "Select directory",
+                    "Select",
+                    &home_dir_or_root(),
+                    move |path| {
+                        if let Some(entry) = entry.upgrade() {
+                            entry.set_text(&path.to_string_lossy());
+                        }
+                    },
+                );
+            });
+            row.append(&button);
+        }
+        form.append(&row);
+    }
+    let hint = Label::new(Some("Choose a prepared guest bundle containing guest.json, a kernel, an initramfs, and a disk image. The bundle is checked before the project is created."));
+    hint.set_wrap(true);
+    hint.set_xalign(0.0);
+    form.append(&hint);
+    let error = workspace_error_label();
+    form.append(&error);
+    let actions = GtkBox::new(Orientation::Horizontal, 8);
+    actions.set_halign(Align::End);
+    let cancel = Button::with_label("Cancel");
+    let create = Button::with_label("Create Simulation");
+    create.add_css_class("suggested-action");
+    actions.append(&cancel);
+    actions.append(&create);
+    form.append(&actions);
+    let busy = Rc::new(Cell::new(false));
+    let closing_busy = busy.clone();
+    window.connect_close_request(move |_| {
+        if closing_busy.get() {
+            gtk::glib::Propagation::Stop
+        } else {
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    let weak = window.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(window) = weak.upgrade() {
+            window.close();
+        }
+    });
+    let weak = window.downgrade();
+    create.connect_clicked(move |button| {
+        let project_name = name.text().trim().to_string();
+        let project_path = path.text().trim().to_string();
+        let guest = bundle.text().trim().to_string();
+        if project_name.is_empty() || project_path.is_empty() || guest.is_empty() {
+            set_error(&error, "Enter a name, project directory, and guest bundle.");
+            return;
+        }
+        if let Err(message) = begin_external_operation() {
+            set_error(&error, &message);
+            return;
+        }
+        set_error(&error, "");
+        busy.set(true);
+        button.set_sensitive(false);
+        cancel.set_sensitive(false);
+        button.set_label("Checking bundle…");
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = send.send(create_project_with_bundle(
+                project_path,
+                &project_name,
+                guest,
+            ));
+        });
+        let weak = weak.clone();
+        let button = button.clone();
+        let cancel = cancel.clone();
+        let error = error.clone();
+        let busy = busy.clone();
+        gtk::glib::timeout_add_local(std::time::Duration::from_millis(40), move || {
+            let result = match receive.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    return gtk::glib::ControlFlow::Continue
+                }
+                Err(_) => Err("Project creation worker exited unexpectedly".into()),
+            };
+            busy.set(false);
+            button.set_sensitive(true);
+            button.set_label("Create Simulation");
+            cancel.set_sensitive(true);
+            finish_external_operation();
+            let result = result.and_then(|project| {
+                let mut config = load_config(&host);
+                config.last_guest_bundle = Some(project.file.vm.base_image.clone());
+                let _ = save_config(&host, &config);
+                open_selected_project(&host, &project)
+            });
+            match result {
+                Ok(()) => {
+                    if let Some(window) = weak.upgrade() {
+                        window.close();
+                    }
+                }
+                Err(message) => set_error(&error, &message),
+            }
+            gtk::glib::ControlFlow::Break
+        });
+    });
+    window.set_child(Some(&form));
+    window.present();
 }
 
 fn create_scroller() -> ScrolledWindow {
@@ -404,8 +568,7 @@ fn overview_lines(recipe: &Recipe) -> Vec<String> {
             "VM envelope: {} / {} MiB / {} cores",
             recipe.vm.base_image, recipe.vm.ram_mb, recipe.vm.cpu_cores
         ),
-        "Launcher mode now selects a local project before entering this scaffold workspace"
-            .to_string(),
+        "Nodes run inside one project VM; the recipe defines their virtual networks".to_string(),
     ]
 }
 
@@ -1085,52 +1248,11 @@ extern "C" fn create_launcher_view(
     });
 
     let host_copy = *host_ref;
-    let recent_projects_copy = recent_projects.clone();
-    let error_label_copy = error_label.clone();
     create_project_button.connect_clicked(move |button| {
-        set_error(&error_label_copy, "");
         let parent = button
             .root()
             .and_then(|root| root.downcast::<gtk::Window>().ok());
-        let host_for_dialog = host_copy;
-        let recent_projects_for_dialog = recent_projects_copy.clone();
-        let error_label_for_dialog = error_label_copy.clone();
-        prompt_directory_picker(
-            parent.as_ref(),
-            "Create New Project",
-            "Create",
-            &home_dir_or_root(),
-            move |path| {
-                if path.as_os_str().is_empty() {
-                    set_error(
-                        &error_label_for_dialog,
-                        "The selected location has no local path.",
-                    );
-                    return;
-                }
-
-                let project_name = path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or("Sim RNS Project")
-                    .to_string();
-
-                match create_project(&path, &project_name)
-                    .and_then(|project| open_selected_project(&host_for_dialog, &project))
-                {
-                    Ok(()) => {
-                        refresh_recent_projects(
-                            &recent_projects_for_dialog,
-                            &host_for_dialog,
-                            &error_label_for_dialog,
-                        );
-                        set_error(&error_label_for_dialog, "");
-                    }
-                    Err(error) => set_error(&error_label_for_dialog, &error),
-                }
-            },
-        );
+        show_new_project_dialog(parent.as_ref(), host_copy);
     });
 
     unsafe {
@@ -1201,9 +1323,8 @@ extern "C" fn create_overview_view(
         root.set_data("sim-rns-runtime-subscription", subscription);
     }
 
-    let scroller = create_scroller();
-    scroller.set_child(Some(&list));
-    root.append(&scroller);
+    // The shell supplies the scrolling viewport for plugin pages.
+    root.append(&list);
 
     unsafe {
         <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
@@ -1281,9 +1402,8 @@ extern "C" fn create_recipe_view(
             .collect::<Vec<_>>(),
     ));
 
-    let scroller = create_scroller();
-    scroller.set_child(Some(&list));
-    root.append(&scroller);
+    // The shell supplies the scrolling viewport for plugin pages.
+    root.append(&list);
 
     unsafe {
         <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
@@ -1330,9 +1450,8 @@ extern "C" fn create_templates_view(
         list.append(&section_card(&template.label, &template_lines(template)));
     }
 
-    let scroller = create_scroller();
-    scroller.set_child(Some(&list));
-    root.append(&scroller);
+    // The shell supplies the scrolling viewport for plugin pages.
+    root.append(&list);
 
     unsafe {
         <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())

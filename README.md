@@ -33,7 +33,7 @@ The `sim-rns-mcp` binary provides a stdio MCP server for the running GTK app. It
 }
 ```
 
-Build the workspace first. From the MCP client, call `launch` to open the app (or attach to an existing instance), then use `app` with `{"operation":"state"}` and `ui` with `{"operation":"tree"}`. The client must run in the same desktop session as the app.
+Build the workspace first. From the MCP client, call `launch` to open the app (or attach to an existing instance), then use `app` with `{"operation":"state"}` and `ui` with `{"operation":"tree"}`. Launch can recover the desktop environment from a running session owned by the same user.
 
 ## Build a guest bundle
 
@@ -50,16 +50,16 @@ python3 guest/build.py \
 
 The output directory must not already exist. The bundle includes `guest.json`, `vmlinuz`, `initrd.gz`, and `base.qcow2`. Rebuild after changing guest code. This is a development image builder, not a reproducible distribution-image pipeline.
 
-## Run the complete example
+## Create and run a simulation
 
 ```sh
 cargo run -p sim-rns-core --bin sim-rns-ctl -- \
-  create-demo /tmp/my-sim /path/to/guest-bundle
+  create /tmp/my-sim /path/to/guest-bundle "My simulation"
 cargo run -p sim-rns-core --bin sim-rns-ctl -- boot /tmp/my-sim
 cargo run -p sim-rns-core --bin sim-rns-ctl -- status /tmp/my-sim
 ```
 
-The demo contains a virtual LAN, two Python Reticulum nodes (`backbone-a` and `phone-a`), and a seeded Python script. The second node keeps the scaffold's existing name; it runs Reticulum, not LXMF. Each Reticulum node creates a distinct persistent identity and sends plaintext diagnostic Reticulum packets over the guest-only LAN. Logs show `IDENTITY` and `RECEIVED hello from ...` entries. QEMU has no host-facing network interface.
+Every new project contains a virtual LAN, two Python Reticulum nodes (`backbone-a` and `phone-a`), and a seeded Python script. The second node keeps the scaffold's existing name; it runs Reticulum, not LXMF. Each Reticulum node creates a distinct persistent identity and sends plaintext diagnostic Reticulum packets over the guest-only LAN. Logs show `IDENTITY` and `RECEIVED hello from ...` entries. QEMU has no host-facing network interface.
 
 Open `/tmp/my-sim` from the GTK app to see live VM/node status and log tails:
 
@@ -69,7 +69,9 @@ cargo run -p sim-rns-app
 
 The CLI also supports `pause`, `resume`, `stop`, `start-node PROJECT ELEMENT_ID`, `stop-node PROJECT ELEMENT_ID`, and `restart-node PROJECT ELEMENT_ID`. The toolbar supports Run (including resume), Pause, and Stop. Closing the UI detaches; Stop shuts down the project. Guest shutdown stops node processes and syncs the data volume before QEMU exits.
 
-For ordinary projects, set `vm.base_image` to a guest-bundle directory or bootable image path. Relative paths are resolved against the project root. A blank image is no longer silently created. The existing generic creation scaffold still references Rust/LXMF templates that this minimal guest does not implement; use `create-demo` for the supported flow.
+In the launcher, choose **Create New Project**, enter a name and destination, and select your guest-bundle directory. The last selected bundle is remembered. Creation checks the manifest, readable nonempty assets, contained paths, and QEMU disk metadata before writing project files; this cannot guarantee that an arbitrary kernel will boot. New projects use 512 MiB RAM and one CPU, with supported Python Reticulum nodes. Click **Run** to boot. `create-demo` remains available as a compatibility shortcut.
+
+Existing projects are unchanged. Their `vm.base_image` may be a guest-bundle directory or bootable image path; relative paths resolve against the project root. A blank image is not silently created.
 
 ## End-to-end verification
 
