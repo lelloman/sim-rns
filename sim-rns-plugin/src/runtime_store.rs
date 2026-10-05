@@ -203,26 +203,6 @@ impl RuntimeViewSnapshot {
         }
     }
 
-    pub(crate) fn project_error(project: Project, error: String) -> Self {
-        Self {
-            project: Some(project),
-            recipe: None,
-            status: None,
-            operation: None,
-            error: Some(error),
-        }
-    }
-
-    pub(crate) fn runtime_error(project: Project, recipe: Recipe, error: String) -> Self {
-        Self {
-            project: Some(project),
-            recipe: Some(recipe),
-            status: None,
-            operation: None,
-            error: Some(error),
-        }
-    }
-
     pub(crate) fn empty() -> Self {
         Self {
             project: None,

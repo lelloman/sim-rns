@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::persistence::{atomic_write, project_lock};
+use crate::qmp::Qmp;
 
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +42,8 @@ pub enum RuntimeBackendState {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeRuntimeState {
+    Unknown,
+    Failed,
     Disabled,
     Stopped,
     Running,
@@ -89,6 +93,8 @@ pub struct RuntimeStatus {
     pub topology_overlay: RuntimeTopologyOverlay,
     pub snapshots: Vec<RuntimeSnapshot>,
     pub recent_events: Vec<RuntimeEvent>,
+    #[serde(default)]
+    pub node_logs: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -182,6 +188,7 @@ pub trait ProjectRuntime {
     ) -> Result<RuntimeCommandOutcome, RuntimeError>;
 }
 
+/// Metadata-only model for tests and offline planning; never controls a guest.
 #[derive(Clone, Debug, Default)]
 pub struct FileBackedRuntime;
 
@@ -242,10 +249,13 @@ struct RuntimeState {
     snapshots: Vec<RuntimeSnapshot>,
     events: Vec<RuntimeEvent>,
     command_clock: u64,
+    #[serde(default)]
+    node_logs: BTreeMap<String, Vec<String>>,
 }
 
 impl ProjectRuntime for FileBackedRuntime {
     fn status(&self, project: &Project) -> Result<RuntimeStatus, RuntimeError> {
+        let _lock = project_lock(&project.root_path).map_err(RuntimeError::Persistence)?;
         let recipe = project_recipe(project).map_err(RuntimeError::ProjectLoad)?;
         let state = load_or_init_state(project, &recipe)?;
         Ok(status_from_state(project, &state, &recipe))
@@ -256,6 +266,7 @@ impl ProjectRuntime for FileBackedRuntime {
         project: &Project,
         command: RuntimeCommand,
     ) -> Result<RuntimeCommandOutcome, RuntimeError> {
+        let _lock = project_lock(&project.root_path).map_err(RuntimeError::Persistence)?;
         let recipe = project_recipe(project).map_err(RuntimeError::ProjectLoad)?;
         let mut state = load_or_init_state(project, &recipe)?;
         let timestamp = unix_time_ms()?;
@@ -275,18 +286,125 @@ impl ProjectRuntime for FileBackedRuntime {
 
 impl ProjectRuntime for QemuRuntime {
     fn status(&self, project: &Project) -> Result<RuntimeStatus, RuntimeError> {
-        let mut status = FileBackedRuntime.status(project)?;
-        let layout = self.layout(project);
-        let process_running = qemu_process_is_running(&layout)?;
-        status.vm_assets = vm_assets(&layout);
-        if process_running {
-            if status.vm_state == RuntimeVmState::Stopped {
-                status.vm_state = RuntimeVmState::Running;
-                status.backend_state = RuntimeBackendState::Reachable;
+        let _lock = project_lock(&project.root_path).map_err(RuntimeError::Persistence)?;
+        let recipe = project_recipe(project).map_err(RuntimeError::ProjectLoad)?;
+        let state = load_or_init_state(project, &recipe)?;
+        self.observe_status(project, &state, &recipe)
+    }
+
+    fn execute(
+        &self,
+        project: &Project,
+        command: RuntimeCommand,
+    ) -> Result<RuntimeCommandOutcome, RuntimeError> {
+        // Validate all input before performing any external side effects.
+        let _lock = project_lock(&project.root_path).map_err(RuntimeError::Persistence)?;
+        let recipe = project_recipe(project).map_err(RuntimeError::ProjectLoad)?;
+        let mut state = load_or_init_state(project, &recipe)?;
+        if matches!(command, RuntimeCommand::Pause | RuntimeCommand::Shutdown) {
+            let observed = self.observe_status(project, &state, &recipe)?;
+            state.nodes = observed.nodes;
+            state.node_logs = observed.node_logs;
+        }
+        let message = match command {
+            RuntimeCommand::PrepareVm {
+                source_image,
+                size_gb,
+            } => {
+                self.prepare_vm(project, source_image, size_gb)?;
+                "VM image prepared."
             }
-        } else {
-            status.vm_state = RuntimeVmState::Stopped;
-            status.backend_state = RuntimeBackendState::Offline;
+            RuntimeCommand::Boot => {
+                self.boot(project)?;
+                "VM booted."
+            }
+            RuntimeCommand::Shutdown => {
+                self.shutdown(project)?;
+                "VM stopped."
+            }
+            RuntimeCommand::Pause => {
+                if self.observed_vm_state(project)? != RuntimeVmState::Running {
+                    return Err(RuntimeError::Unavailable(
+                        "only a running VM can be paused".into(),
+                    ));
+                }
+                self.qmp_execute(project, "stop")?;
+                "VM paused."
+            }
+            RuntimeCommand::Resume => {
+                if self.observed_vm_state(project)? != RuntimeVmState::Paused {
+                    return Err(RuntimeError::Unavailable(
+                        "only a paused VM can be resumed".into(),
+                    ));
+                }
+                self.qmp_execute(project, "cont")?;
+                "VM resumed."
+            }
+            RuntimeCommand::StartNode { element_id } => {
+                self.guest_command(project, "start_node", &element_id)?;
+                "Guest node started."
+            }
+            RuntimeCommand::StopNode { element_id } => {
+                self.guest_command(project, "stop_node", &element_id)?;
+                "Guest node stopped."
+            }
+            RuntimeCommand::RestartNode { element_id } => {
+                self.guest_command(project, "restart_node", &element_id)?;
+                "Guest node restarted."
+            }
+            _ => {
+                return Err(RuntimeError::Unsupported(
+                    "this command has no guest-backed implementation yet".into(),
+                ))
+            }
+        }
+        .to_string();
+        let observed = self.observe_status(project, &state, &recipe)?;
+        state.vm_state = observed.vm_state;
+        state.backend_state = observed.backend_state;
+        state.nodes = observed.nodes;
+        state.node_logs = observed.node_logs;
+        let timestamp = unix_time_ms()?;
+        let command_id = next_command_id(&mut state);
+        push_event(&mut state, command_id, timestamp, message.clone());
+        save_state(project, &state)?;
+        Ok(RuntimeCommandOutcome {
+            command_id,
+            timestamp_unix_ms: timestamp,
+            accepted: true,
+            message: Some(message),
+            status: status_from_state(project, &state, &recipe),
+        })
+    }
+}
+
+impl QemuRuntime {
+    fn observe_status(
+        &self,
+        project: &Project,
+        state: &RuntimeState,
+        recipe: &Recipe,
+    ) -> Result<RuntimeStatus, RuntimeError> {
+        let mut status = status_from_state(project, state, recipe);
+        status.vm_state = self.observed_vm_state(project)?;
+        status.backend_state = RuntimeBackendState::Offline;
+        if status.vm_state == RuntimeVmState::Running {
+            if let Ok(guest) = crate::guest::request(
+                &self.layout(project).vm_dir.join("guest.sock"),
+                serde_json::json!({"op":"status"}),
+            ) {
+                status.backend_state = RuntimeBackendState::Reachable;
+                status.nodes = guest.nodes;
+                status.node_logs = guest.logs;
+                status.effective_topology = guest.topology;
+            } else {
+                for node in &mut status.nodes {
+                    if node.enabled {
+                        node.state = NodeRuntimeState::Unknown;
+                    }
+                }
+            }
+        } else if status.vm_state == RuntimeVmState::Stopped {
             for node in &mut status.nodes {
                 if node.enabled {
                     node.state = NodeRuntimeState::Stopped;
@@ -296,47 +414,24 @@ impl ProjectRuntime for QemuRuntime {
         Ok(status)
     }
 
-    fn execute(
+    fn guest_command(
         &self,
         project: &Project,
-        command: RuntimeCommand,
-    ) -> Result<RuntimeCommandOutcome, RuntimeError> {
-        match command {
-            RuntimeCommand::PrepareVm {
-                source_image,
-                size_gb,
-            } => {
-                self.prepare_vm(project, source_image, size_gb)?;
-                FileBackedRuntime.execute(
-                    project,
-                    RuntimeCommand::PrepareVm {
-                        source_image: None,
-                        size_gb,
-                    },
-                )
-            }
-            RuntimeCommand::Boot => {
-                self.boot(project)?;
-                FileBackedRuntime.execute(project, RuntimeCommand::Boot)
-            }
-            RuntimeCommand::Shutdown => {
-                self.shutdown(project)?;
-                FileBackedRuntime.execute(project, RuntimeCommand::Shutdown)
-            }
-            RuntimeCommand::Pause => {
-                self.qmp_execute(project, "stop")?;
-                FileBackedRuntime.execute(project, RuntimeCommand::Pause)
-            }
-            RuntimeCommand::Resume => {
-                self.qmp_execute(project, "cont")?;
-                FileBackedRuntime.execute(project, RuntimeCommand::Resume)
-            }
-            command => FileBackedRuntime.execute(project, command),
+        operation: &str,
+        element_id: &str,
+    ) -> Result<(), RuntimeError> {
+        if self.observed_vm_state(project)? != RuntimeVmState::Running {
+            return Err(RuntimeError::Unavailable(
+                "guest commands require a running VM".into(),
+            ));
         }
+        crate::guest::request(
+            &self.layout(project).vm_dir.join("guest.sock"),
+            serde_json::json!({"op":operation,"element_id":element_id}),
+        )?;
+        Ok(())
     }
-}
 
-impl QemuRuntime {
     fn prepare_vm(
         &self,
         project: &Project,
@@ -348,50 +443,71 @@ impl QemuRuntime {
         if layout.disk_image_path.exists() {
             return Err(RuntimeError::Validation(format!(
                 "VM disk image already exists at {}",
-                layout.disk_image_path.display()
+                layout
+                    .disk_image_path
+                    .display()
+                    .to_string()
+                    .replace(',', ",,")
             )));
         }
-        if let Some(source_image) = source_image {
-            let source_path = PathBuf::from(source_image);
-            if !source_path.is_file() {
-                return Err(RuntimeError::Validation(format!(
-                    "source VM image does not exist at {}",
-                    source_path.display()
-                )));
-            }
-            std::fs::copy(&source_path, &layout.disk_image_path).map_err(|error| {
-                RuntimeError::Persistence(format!(
-                    "failed to import {} to {}: {error}",
-                    source_path.display(),
-                    layout.disk_image_path.display()
-                ))
-            })?;
-            return Ok(());
-        }
-
-        let disk_size_gb = if size_gb == 0 { 8 } else { size_gb };
-        let status = Command::new(&self.qemu_img_binary)
-            .arg("create")
-            .arg("-f")
-            .arg("qcow2")
-            .arg(&layout.disk_image_path)
-            .arg(format!("{disk_size_gb}G"))
-            .status()
-            .map_err(|error| {
-                RuntimeError::Unavailable(format!(
-                    "failed to run `{}`: {error}",
-                    self.qemu_img_binary
-                ))
-            })?;
-        if status.success() {
-            Ok(())
+        let source_image = source_image.unwrap_or_else(|| project.file.vm.base_image.clone());
+        let source_path = PathBuf::from(&source_image);
+        let source_path = if source_path.is_absolute() {
+            source_path
         } else {
-            Err(RuntimeError::Unavailable(format!(
-                "`{}` failed to create {}",
-                self.qemu_img_binary,
-                layout.disk_image_path.display()
-            )))
+            project.root_path.join(source_path)
+        };
+        let source_path = if source_path.is_dir() {
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(source_path.join("guest.json"))
+                    .map_err(|e| RuntimeError::Validation(e.to_string()))?,
+            )
+            .map_err(|e| RuntimeError::Validation(e.to_string()))?;
+            if manifest["version"] != 1 {
+                return Err(RuntimeError::Validation(
+                    "unsupported guest bundle version".into(),
+                ));
+            }
+            for (field, target) in [("kernel", "vmlinuz"), ("initrd", "initrd.gz")] {
+                let relative = manifest[field].as_str().ok_or_else(|| {
+                    RuntimeError::Validation(format!("guest bundle missing {field}"))
+                })?;
+                let source = crate::resolve_project_relative_path(&source_path, relative)
+                    .map_err(RuntimeError::Validation)?;
+                std::fs::copy(source, layout.vm_dir.join(target))
+                    .map_err(|e| RuntimeError::Persistence(e.to_string()))?;
+            }
+            let disk = manifest["disk"]
+                .as_str()
+                .ok_or_else(|| RuntimeError::Validation("guest bundle missing disk".into()))?;
+            crate::resolve_project_relative_path(&source_path, disk)
+                .map_err(RuntimeError::Validation)?
+        } else {
+            source_path
+        };
+        if !source_path.is_file() {
+            return Err(RuntimeError::Validation(format!(
+                "base image {} is missing; supply a bootable guest image (an empty disk cannot run a simulation)", source_path.display()
+            )));
         }
+        let _ = size_gb; // Imported guest disks keep their actual size.
+        let temporary = layout.vm_dir.join("disk.importing.qcow2");
+        let output = Command::new(&self.qemu_img_binary)
+            .args(["convert", "-O", "qcow2"])
+            .arg(&source_path)
+            .arg(&temporary)
+            .output()
+            .map_err(|error| RuntimeError::Unavailable(format!("qemu-img: {error}")))?;
+        if !output.status.success() {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(RuntimeError::Validation(format!(
+                "invalid guest image: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        std::fs::rename(&temporary, &layout.disk_image_path)
+            .map_err(|error| RuntimeError::Persistence(error.to_string()))?;
+        Ok(())
     }
 
     fn boot(&self, project: &Project) -> Result<(), RuntimeError> {
@@ -405,7 +521,11 @@ impl QemuRuntime {
         if !layout.disk_image_path.is_file() {
             return Err(RuntimeError::Validation(format!(
                 "VM disk image is missing at {}; create or import it before booting",
-                layout.disk_image_path.display()
+                layout
+                    .disk_image_path
+                    .display()
+                    .to_string()
+                    .replace(',', ",,")
             )));
         }
         let log = std::fs::OpenOptions::new()
@@ -425,7 +545,24 @@ impl QemuRuntime {
             ))
         })?;
         let _ = std::fs::remove_file(&layout.qmp_socket_path);
-        let child = Command::new(&self.qemu_binary)
+        let mut command = Command::new(&self.qemu_binary);
+        command.process_group(0);
+        command.args(["-machine", "accel=kvm:tcg"]);
+        if layout.vm_dir.join("vmlinuz").is_file() && layout.vm_dir.join("initrd.gz").is_file() {
+            command
+                .arg("-kernel")
+                .arg(layout.vm_dir.join("vmlinuz"))
+                .arg("-initrd")
+                .arg(layout.vm_dir.join("initrd.gz"))
+                .args(["-append", "console=ttyS0 panic=-1 quiet", "-no-reboot"])
+                .arg("-chardev")
+                .arg(format!(
+                    "socket,id=guest,path={},server=on,wait=off",
+                    layout.vm_dir.join("guest.sock").display()
+                ))
+                .args(["-device", "isa-serial,chardev=guest"]);
+        }
+        let mut child = command
             .arg("-name")
             .arg(format!("sim-rns-{}", project.file.project_id))
             .arg("-m")
@@ -435,7 +572,11 @@ impl QemuRuntime {
             .arg("-drive")
             .arg(format!(
                 "file={},if=virtio,format=qcow2",
-                layout.disk_image_path.display()
+                layout
+                    .disk_image_path
+                    .display()
+                    .to_string()
+                    .replace(',', ",,")
             ))
             .arg("-qmp")
             .arg(format!(
@@ -445,7 +586,10 @@ impl QemuRuntime {
             .arg("-display")
             .arg("none")
             .arg("-serial")
-            .arg("mon:stdio")
+            .arg("stdio")
+            .arg("-nic")
+            .arg("none")
+            .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_for_stderr))
             .spawn()
@@ -455,12 +599,69 @@ impl QemuRuntime {
                     self.qemu_binary
                 ))
             })?;
-        std::fs::write(&layout.pid_path, child.id().to_string()).map_err(|error| {
-            RuntimeError::Persistence(format!(
-                "failed to write {}: {error}",
-                layout.pid_path.display()
-            ))
-        })?;
+        let ready = (|| {
+            let identity = ProcessIdentity::read(child.id())?
+                .ok_or_else(|| RuntimeError::Unavailable("QEMU exited during startup".into()))?;
+            let payload = serde_json::to_vec(&identity)
+                .map_err(|e| RuntimeError::Persistence(e.to_string()))?;
+            atomic_write(&layout.pid_path, &payload).map_err(RuntimeError::Persistence)?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(exit) = child
+                    .try_wait()
+                    .map_err(|e| RuntimeError::Unavailable(e.to_string()))?
+                {
+                    return Err(RuntimeError::Unavailable(format!(
+                        "QEMU exited ({exit}); see {}",
+                        layout.log_path.display()
+                    )));
+                }
+                match self.observed_vm_state(project) {
+                    Ok(RuntimeVmState::Running) => break,
+                    result if Instant::now() >= deadline => {
+                        return Err(RuntimeError::Unavailable(format!(
+                            "QEMU did not become ready: {result:?}; see {}",
+                            layout.log_path.display()
+                        )))
+                    }
+                    _ => thread::sleep(Duration::from_millis(50)),
+                }
+            }
+            if layout.vm_dir.join("initrd.gz").is_file() {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                loop {
+                    match crate::guest::request(
+                        &layout.vm_dir.join("guest.sock"),
+                        serde_json::json!({"op":"status"}),
+                    ) {
+                        Ok(_) => break,
+                        Err(error) if Instant::now() >= deadline => return Err(error),
+                        Err(_) => thread::sleep(Duration::from_millis(250)),
+                    }
+                    if child
+                        .try_wait()
+                        .map_err(|e| RuntimeError::Unavailable(e.to_string()))?
+                        .is_some()
+                    {
+                        return Err(RuntimeError::Unavailable(
+                            "guest exited before backend initialization".into(),
+                        ));
+                    }
+                }
+                crate::guest::provision(project, &layout.vm_dir.join("guest.sock"))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = ready {
+            let _ = child.kill();
+            let _ = child.wait();
+            cleanup_stale_vm_files(&layout);
+            return Err(error);
+        }
+        // Reap the exact child even when it exits asynchronously, without keeping GTK blocked.
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
         Ok(())
     }
 
@@ -470,58 +671,62 @@ impl QemuRuntime {
             cleanup_stale_vm_files(&layout);
             return Ok(());
         }
-        if self.qmp_execute(project, "quit").is_err() {
-            let pid = read_pid(&layout)?;
-            Command::new("kill")
-                .arg(pid.to_string())
-                .status()
-                .map_err(|error| {
-                    RuntimeError::Unavailable(format!("failed to run kill: {error}"))
-                })?;
-        } else if !wait_for_qemu_exit(&layout)? {
-            let pid = read_pid(&layout)?;
-            Command::new("kill")
-                .arg(pid.to_string())
-                .status()
-                .map_err(|error| {
-                    RuntimeError::Unavailable(format!("failed to run kill: {error}"))
-                })?;
+        if layout.vm_dir.join("initrd.gz").is_file() {
+            if self.observed_vm_state(project)? == RuntimeVmState::Paused {
+                self.qmp_execute(project, "cont")?;
+            }
+            crate::guest::request(
+                &layout.vm_dir.join("guest.sock"),
+                serde_json::json!({"op":"shutdown"}),
+            )?;
+        }
+        // A failed QMP exchange must retain tracking. Never signal an unverified numeric PID.
+        self.qmp_execute(project, "quit")?;
+        if !wait_for_qemu_exit(&layout)? {
+            return Err(RuntimeError::Unavailable(
+                "QEMU did not exit; process tracking retained".into(),
+            ));
         }
         cleanup_stale_vm_files(&layout);
         Ok(())
     }
 
-    fn qmp_execute(&self, project: &Project, command: &str) -> Result<(), RuntimeError> {
+    fn qmp(&self, project: &Project) -> Result<Qmp, RuntimeError> {
         let layout = self.layout(project);
         if !qemu_process_is_running(&layout)? {
             return Err(RuntimeError::Unavailable(
-                "project VM is not running".to_string(),
+                "project VM is not running".into(),
             ));
         }
-        let mut stream = UnixStream::connect(&layout.qmp_socket_path).map_err(|error| {
-            RuntimeError::Unavailable(format!(
-                "failed to connect to QMP socket {}: {error}",
-                layout.qmp_socket_path.display()
-            ))
-        })?;
-        stream
-            .set_read_timeout(Some(Duration::from_millis(250)))
-            .map_err(|error| {
-                RuntimeError::Unavailable(format!("failed to set QMP timeout: {error}"))
-            })?;
-        let mut greeting = [0_u8; 4096];
-        let _ = stream.read(&mut greeting);
-        stream
-            .write_all(b"{\"execute\":\"qmp_capabilities\"}\n")
-            .map_err(|error| {
-                RuntimeError::Unavailable(format!("failed to send QMP capabilities: {error}"))
-            })?;
-        let _ = stream.read(&mut greeting);
-        let payload = format!("{{\"execute\":\"{command}\"}}\n");
-        stream.write_all(payload.as_bytes()).map_err(|error| {
-            RuntimeError::Unavailable(format!("failed to send QMP command `{command}`: {error}"))
-        })?;
+        let mut qmp = Qmp::connect(&layout.qmp_socket_path)?;
+        let name = qmp.execute("query-name")?;
+        if name.get("name").and_then(serde_json::Value::as_str)
+            != Some(&format!("sim-rns-{}", project.file.project_id))
+        {
+            return Err(RuntimeError::Unavailable(
+                "QMP endpoint belongs to a different VM".into(),
+            ));
+        }
+        Ok(qmp)
+    }
+
+    fn qmp_execute(&self, project: &Project, command: &str) -> Result<(), RuntimeError> {
+        self.qmp(project)?.execute(command)?;
         Ok(())
+    }
+
+    fn observed_vm_state(&self, project: &Project) -> Result<RuntimeVmState, RuntimeError> {
+        if !qemu_process_is_running(&self.layout(project))? {
+            return Ok(RuntimeVmState::Stopped);
+        }
+        let status = self.qmp(project)?.execute("query-status")?;
+        match status.get("status").and_then(serde_json::Value::as_str) {
+            Some("running") => Ok(RuntimeVmState::Running),
+            Some("paused" | "prelaunch") => Ok(RuntimeVmState::Paused),
+            other => Err(RuntimeError::Unavailable(format!(
+                "QEMU is not operational: {other:?}"
+            ))),
+        }
     }
 }
 
@@ -547,7 +752,6 @@ fn load_or_init_state(project: &Project, recipe: &Recipe) -> Result<RuntimeState
     };
     let mut state = state;
     reconcile_state(&mut state, project, recipe);
-    save_state(project, &state)?;
     Ok(state)
 }
 
@@ -576,6 +780,7 @@ fn initial_state(project: &Project, recipe: &Recipe) -> RuntimeState {
         snapshots: Vec::new(),
         events: Vec::new(),
         command_clock: 0,
+        node_logs: BTreeMap::new(),
     }
 }
 
@@ -597,6 +802,12 @@ fn reconcile_state(state: &mut RuntimeState, project: &Project, recipe: &Recipe)
     state
         .nodes
         .retain(|node| elements.contains_key(&node.element_id));
+    state.topology_overlay.additions.retain(|link| {
+        elements.contains_key(&link.element_id) && elements.contains_key(&link.network_id)
+    });
+    state.topology_overlay.removals.retain(|link| {
+        elements.contains_key(&link.element_id) && elements.contains_key(&link.network_id)
+    });
 
     for node in &mut state.nodes {
         if let Some((template_id, enabled)) = elements.get(&node.element_id) {
@@ -681,7 +892,7 @@ fn apply_command(
                 ));
             }
             let snapshot = RuntimeSnapshot {
-                id: format!("snapshot-{timestamp}"),
+                id: format!("snapshot-{timestamp}-{}", state.command_clock),
                 name: snapshot_name.to_string(),
                 note,
                 created_at_unix_ms: timestamp,
@@ -742,6 +953,15 @@ fn apply_command(
         } => {
             validate_element(recipe, &element_id)?;
             validate_element(recipe, &network_id)?;
+            if !recipe
+                .elements
+                .iter()
+                .any(|e| e.id == network_id && e.template_id == "network.lan")
+            {
+                return Err(RuntimeError::Validation(
+                    "topology target must be a network".into(),
+                ));
+            }
             let link = Attachment {
                 element_id,
                 network_id,
@@ -766,6 +986,15 @@ fn apply_command(
         } => {
             validate_element(recipe, &element_id)?;
             validate_element(recipe, &network_id)?;
+            if !recipe
+                .elements
+                .iter()
+                .any(|e| e.id == network_id && e.template_id == "network.lan")
+            {
+                return Err(RuntimeError::Validation(
+                    "topology target must be a network".into(),
+                ));
+            }
             let link = Attachment {
                 element_id,
                 network_id,
@@ -846,6 +1075,7 @@ fn status_from_state(project: &Project, state: &RuntimeState, recipe: &Recipe) -
         topology_overlay: state.topology_overlay.clone(),
         snapshots: state.snapshots.clone(),
         recent_events: state.events.iter().rev().take(20).cloned().collect(),
+        node_logs: state.node_logs.clone(),
     }
 }
 
@@ -893,9 +1123,7 @@ fn save_state(project: &Project, state: &RuntimeState) -> Result<(), RuntimeErro
     let payload = serde_json::to_string_pretty(state).map_err(|error| {
         RuntimeError::Persistence(format!("failed to serialize runtime state: {error}"))
     })?;
-    std::fs::write(&path, payload).map_err(|error| {
-        RuntimeError::Persistence(format!("failed to write {}: {error}", path.display()))
-    })
+    atomic_write(&path, payload.as_bytes()).map_err(RuntimeError::Persistence)
 }
 
 fn runtime_state_path(project: &Project) -> PathBuf {
@@ -945,42 +1173,62 @@ fn vm_assets(layout: &RuntimeVmLayout) -> RuntimeVmAssets {
     }
 }
 
-fn read_pid(layout: &RuntimeVmLayout) -> Result<u32, RuntimeError> {
-    let payload = std::fs::read_to_string(&layout.pid_path).map_err(|error| {
-        RuntimeError::Persistence(format!(
-            "failed to read {}: {error}",
-            layout.pid_path.display()
-        ))
-    })?;
-    payload.trim().parse::<u32>().map_err(|error| {
-        RuntimeError::Persistence(format!(
-            "failed to parse pid from {}: {error}",
-            layout.pid_path.display()
-        ))
-    })
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ProcessIdentity {
+    pid: u32,
+    start_ticks: u64,
+    boot_id: String,
+}
+
+impl ProcessIdentity {
+    fn read(pid: u32) -> Result<Option<Self>, RuntimeError> {
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(RuntimeError::Unavailable(error.to_string())),
+        };
+        let fields: Vec<_> = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| RuntimeError::Unavailable("invalid process stat".into()))?
+            .1
+            .split_whitespace()
+            .collect();
+        if matches!(fields.first(), Some(&"Z" | &"X")) {
+            return Ok(None);
+        }
+        let start_ticks = fields
+            .get(19)
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| RuntimeError::Unavailable("invalid process start time".into()))?;
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|e| RuntimeError::Unavailable(e.to_string()))?;
+        Ok(Some(Self {
+            pid,
+            start_ticks,
+            boot_id,
+        }))
+    }
 }
 
 fn qemu_process_is_running(layout: &RuntimeVmLayout) -> Result<bool, RuntimeError> {
-    if !layout.pid_path.is_file() {
-        return Ok(false);
-    }
-    let pid = read_pid(layout)?;
-    let status = Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .map_err(|error| RuntimeError::Unavailable(format!("failed to run kill -0: {error}")))?;
-    if status.success() {
-        Ok(true)
-    } else {
-        cleanup_stale_vm_files(layout);
-        Ok(false)
-    }
+    let payload = match std::fs::read(&layout.pid_path) {
+        Ok(payload) => payload,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(RuntimeError::Persistence(error.to_string())),
+    };
+    let identity: ProcessIdentity = serde_json::from_slice(&payload).map_err(|_| {
+        RuntimeError::Unavailable(format!(
+            "unverified/legacy PID file {}; stop the old VM and remove this file before booting",
+            layout.pid_path.display()
+        ))
+    })?;
+    Ok(ProcessIdentity::read(identity.pid)?.as_ref() == Some(&identity))
 }
 
 fn cleanup_stale_vm_files(layout: &RuntimeVmLayout) {
     let _ = std::fs::remove_file(&layout.pid_path);
     let _ = std::fs::remove_file(&layout.qmp_socket_path);
+    let _ = std::fs::remove_file(layout.vm_dir.join("guest.sock"));
 }
 
 fn wait_for_qemu_exit(layout: &RuntimeVmLayout) -> Result<bool, RuntimeError> {
@@ -1027,7 +1275,7 @@ mod tests {
         assert_eq!(status.project_id, project.file.project_id);
         assert_eq!(status.vm_state, RuntimeVmState::Stopped);
         assert_eq!(status.nodes.len(), recipe.elements.len());
-        assert!(root.join(".sim-rns/runtime-state.json").is_file());
+        assert!(!root.join(".sim-rns/runtime-state.json").exists());
     }
 
     #[test]
@@ -1264,8 +1512,8 @@ mod tests {
         let layout = runtime.layout(&project);
         assert!(status.vm_assets.prepared);
         assert_eq!(
-            std::fs::read(&layout.disk_image_path).expect("disk should exist"),
-            b"base image bytes"
+            &std::fs::read(&layout.disk_image_path).expect("disk should exist")[..4],
+            b"QFI\xfb"
         );
         assert!(layout.snapshots_dir.is_dir());
         assert!(layout.logs_dir.is_dir());
@@ -1295,5 +1543,136 @@ mod tests {
             std::fs::read(&layout.disk_image_path).expect("disk should still exist"),
             b"existing"
         );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_regressions {
+    use super::*;
+
+    fn project(name: &str) -> Project {
+        crate::create_project(
+            std::env::temp_dir().join(format!(
+                "sim-rns-{name}-{}-{}",
+                std::process::id(),
+                unix_time_ms().unwrap()
+            )),
+            name,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires qemu-system-x86_64 and qemu-img"]
+    fn real_qemu_lifecycle() {
+        let mut project = project("qemu");
+        project.file.vm.ram_mb = 128;
+        project.file.vm.cpu_cores = 1;
+        let runtime = QemuRuntime::default();
+        let layout = runtime.layout(&project);
+        ensure_runtime_layout(&layout).unwrap();
+        assert!(Command::new("qemu-img")
+            .args(["create", "-f", "qcow2"])
+            .arg(&layout.disk_image_path)
+            .arg("16M")
+            .status()
+            .unwrap()
+            .success());
+        let result = (|| {
+            assert_eq!(
+                runtime
+                    .execute(&project, RuntimeCommand::Boot)?
+                    .status
+                    .vm_state,
+                RuntimeVmState::Running
+            );
+            assert_eq!(
+                runtime
+                    .execute(&project, RuntimeCommand::Pause)?
+                    .status
+                    .vm_state,
+                RuntimeVmState::Paused
+            );
+            assert_eq!(
+                runtime
+                    .execute(&project, RuntimeCommand::Resume)?
+                    .status
+                    .vm_state,
+                RuntimeVmState::Running
+            );
+            Ok::<(), RuntimeError>(())
+        })();
+        let shutdown = runtime.execute(&project, RuntimeCommand::Shutdown);
+        result.unwrap();
+        assert_eq!(shutdown.unwrap().status.vm_state, RuntimeVmState::Stopped);
+        assert!(!layout.pid_path.exists());
+        std::fs::remove_dir_all(project.root_path).unwrap();
+    }
+
+    #[test]
+    fn legacy_pid_is_never_signalled() {
+        let project = project("legacy-pid");
+        let runtime = QemuRuntime::default();
+        let layout = runtime.layout(&project);
+        ensure_runtime_layout(&layout).unwrap();
+        std::fs::write(&layout.pid_path, std::process::id().to_string()).unwrap();
+        assert!(runtime.execute(&project, RuntimeCommand::Shutdown).is_err());
+        assert!(layout.pid_path.exists());
+        std::fs::remove_dir_all(project.root_path).unwrap();
+    }
+
+    #[test]
+    fn failed_boot_is_reaped_and_does_not_claim_success() {
+        let project = project("failed-boot");
+        let runtime = QemuRuntime::new("/bin/false");
+        let layout = runtime.layout(&project);
+        ensure_runtime_layout(&layout).unwrap();
+        std::fs::write(&layout.disk_image_path, b"stub").unwrap();
+        assert!(runtime.execute(&project, RuntimeCommand::Boot).is_err());
+        assert!(!layout.pid_path.exists());
+        assert_eq!(
+            runtime.status(&project).unwrap().vm_state,
+            RuntimeVmState::Stopped
+        );
+        std::fs::remove_dir_all(project.root_path).unwrap();
+    }
+
+    #[test]
+    fn unresponsive_qmp_retains_process_tracking() {
+        let project = project("unresponsive");
+        let runtime = QemuRuntime::default();
+        let layout = runtime.layout(&project);
+        ensure_runtime_layout(&layout).unwrap();
+        let identity = ProcessIdentity::read(std::process::id()).unwrap().unwrap();
+        std::fs::write(&layout.pid_path, serde_json::to_vec(&identity).unwrap()).unwrap();
+        assert!(runtime.execute(&project, RuntimeCommand::Shutdown).is_err());
+        assert!(layout.pid_path.exists());
+        std::fs::remove_dir_all(project.root_path).unwrap();
+    }
+
+    #[test]
+    fn stale_identity_and_unsupported_commands_never_claim_live_state() {
+        let project = project("stale");
+        let runtime = QemuRuntime::default();
+        let layout = runtime.layout(&project);
+        ensure_runtime_layout(&layout).unwrap();
+        let mut identity = ProcessIdentity::read(std::process::id()).unwrap().unwrap();
+        identity.start_ticks += 1;
+        std::fs::write(&layout.pid_path, serde_json::to_vec(&identity).unwrap()).unwrap();
+        assert_eq!(
+            runtime.status(&project).unwrap().vm_state,
+            RuntimeVmState::Stopped
+        );
+        assert!(matches!(
+            runtime.execute(
+                &project,
+                RuntimeCommand::CreateSnapshot {
+                    name: "fake".into(),
+                    note: None
+                }
+            ),
+            Err(RuntimeError::Unsupported(_))
+        ));
+        std::fs::remove_dir_all(project.root_path).unwrap();
     }
 }

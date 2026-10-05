@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::rc::Rc;
 use std::thread;
 
@@ -39,6 +40,8 @@ const CMD_STOP_PROJECT: &str = "sim-rns.runtime.stop";
 
 thread_local! {
     static RUNTIME_CONTROLLER: RuntimeController = RuntimeController::default();
+    static RUNTIME_GENERATION: Cell<u64> = const { Cell::new(0) };
+    static REFRESH_PENDING: Cell<bool> = const { Cell::new(false) };
 }
 
 pub struct SimRnsPlugin;
@@ -138,6 +141,12 @@ extern "C" fn open_project_launcher_command(_payload: MzBytes) -> MzStatus {
 }
 
 extern "C" fn close_project_command(_payload: MzBytes) -> MzStatus {
+    if runtime_command_is_busy() {
+        publish_runtime_error(
+            "Wait for the runtime operation to finish before closing the project.".into(),
+        );
+        return MzStatus::new(MzStatusCode::InvalidArgument);
+    }
     match close_project() {
         Ok(()) => {
             refresh_runtime_store();
@@ -213,12 +222,13 @@ fn spawn_runtime_command(
     if runtime_command_is_busy() {
         return MzStatus::new(MzStatusCode::InvalidArgument);
     }
+    RUNTIME_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
     RUNTIME_CONTROLLER.with(|controller| controller.begin_operation(operation));
 
     let completion_handle = handle.clone();
     thread::spawn(move || {
         let result = run_runtime_command_for_handle(handle, command);
-        gtk::glib::MainContext::default().invoke(move || {
+        gtk::glib::idle_add_once(move || {
             if current_project_handle().as_ref() != Some(&completion_handle) {
                 return;
             }
@@ -241,33 +251,46 @@ fn runtime_command_is_busy() -> bool {
 }
 
 fn refresh_runtime_store() {
+    RUNTIME_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
     RUNTIME_CONTROLLER.with(|controller| {
-        controller.refresh(load_runtime_snapshot);
+        controller.refresh(RuntimeViewSnapshot::empty);
+    });
+    refresh_runtime_async();
+}
+
+fn refresh_runtime_async() {
+    if runtime_command_is_busy() || REFRESH_PENDING.with(Cell::get) {
+        return;
+    }
+    let Some(handle) = current_project_handle() else {
+        return;
+    };
+    REFRESH_PENDING.with(|pending| pending.set(true));
+    let generation = RUNTIME_GENERATION.with(Cell::get);
+    thread::spawn(move || {
+        let snapshot = match load_project(&handle.path).and_then(load_runtime_snapshot_for_project)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => RuntimeViewSnapshot::error(error),
+        };
+        gtk::glib::idle_add_once(move || {
+            REFRESH_PENDING.with(|pending| pending.set(false));
+            if current_project_handle().as_ref() == Some(&handle)
+                && RUNTIME_GENERATION.with(Cell::get) == generation
+                && !runtime_command_is_busy()
+            {
+                RUNTIME_CONTROLLER.with(|controller| {
+                    controller.refresh(|| snapshot);
+                });
+            }
+        });
     });
 }
 
 fn publish_runtime_error(error: String) {
     RUNTIME_CONTROLLER.with(|controller| {
-        controller.publish_error(error, load_runtime_snapshot);
+        controller.publish_error(error, RuntimeViewSnapshot::empty);
     });
-}
-
-fn load_runtime_snapshot() -> RuntimeViewSnapshot {
-    let project = match load_workspace_project() {
-        Ok(project) => project,
-        Err(error) => return RuntimeViewSnapshot::error(error),
-    };
-    let recipe = match project_recipe(&project) {
-        Ok(recipe) => recipe,
-        Err(error) => return RuntimeViewSnapshot::project_error(project, error),
-    };
-    let status = match QemuRuntime::default().status(&project) {
-        Ok(status) => status,
-        Err(error) => {
-            return RuntimeViewSnapshot::runtime_error(project, recipe, error.to_string())
-        }
-    };
-    RuntimeViewSnapshot::loaded(project, recipe, status)
 }
 
 fn load_runtime_snapshot_for_project(project: Project) -> Result<RuntimeViewSnapshot, String> {
@@ -283,8 +306,12 @@ fn run_runtime_command_for_handle(
     command: impl FnOnce(Project) -> Result<(), String>,
 ) -> Result<RuntimeViewSnapshot, String> {
     let project = load_project(handle.path)?;
-    command(project.clone())?;
-    load_runtime_snapshot_for_project(project)
+    let result = command(project.clone());
+    let snapshot = load_runtime_snapshot_for_project(project)?;
+    Ok(match result {
+        Ok(()) => snapshot,
+        Err(error) => snapshot.with_error(error),
+    })
 }
 
 fn build_root(title: &str, subtitle: &str) -> GtkBox {
@@ -461,7 +488,8 @@ fn write_local_launcher_config(config: &LauncherConfig) -> Result<(), MzStatusCo
         std::fs::create_dir_all(parent).map_err(|_| MzStatusCode::InternalError)?;
     }
     let payload = serde_json::to_string_pretty(config).map_err(|_| MzStatusCode::InternalError)?;
-    std::fs::write(path, payload).map_err(|_| MzStatusCode::InternalError)
+    sim_rns_core::persistence::atomic_write(&path, payload.as_bytes())
+        .map_err(|_| MzStatusCode::InternalError)
 }
 
 fn home_dir_or_root() -> std::path::PathBuf {
@@ -700,6 +728,9 @@ fn populate_overview_from_snapshot(
     if let Some(status) = &snapshot.status {
         list.append(&section_card("Runtime", &runtime_summary_lines(status)));
         list.append(&section_card("Runtime Nodes", &runtime_node_lines(status)));
+        for (node, lines) in &status.node_logs {
+            list.append(&section_card(&format!("Logs: {node}"), lines));
+        }
         list.append(&section_card(
             "Runtime Topology",
             &runtime_topology_lines(status),
@@ -948,9 +979,12 @@ extern "C" fn create_launcher_view(
     branding.set_valign(Align::Center);
     branding.set_halign(Align::Center);
 
-    let icon_file =
-        gio::File::for_path(concat!(env!("CARGO_MANIFEST_DIR"), "/../sim-rns-icon.svg"));
-    let icon_picture = Picture::for_file(&icon_file);
+    let icon_bytes = gtk::glib::Bytes::from_static(include_bytes!("../../sim-rns-icon.svg"));
+    let icon_stream = gio::MemoryInputStream::from_bytes(&icon_bytes);
+    let icon_picture = Picture::new();
+    if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_stream(&icon_stream, gio::Cancellable::NONE) {
+        icon_picture.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&pixbuf)));
+    }
     icon_picture.set_can_shrink(true);
     icon_picture.set_halign(Align::Center);
     icon_picture.set_valign(Align::Center);
@@ -1098,22 +1132,27 @@ extern "C" fn create_overview_view(
         return std::ptr::null_mut();
     }
 
-    let snapshot =
-        RUNTIME_CONTROLLER.with(|controller| controller.latest_or_refresh(load_runtime_snapshot));
+    let snapshot = RUNTIME_CONTROLLER
+        .with(|controller| controller.latest_or_refresh(RuntimeViewSnapshot::empty));
     let title = snapshot
         .project
         .as_ref()
         .map(|project| project.file.name.as_str())
         .unwrap_or("Open a project");
-    let subtitle = if snapshot.project.is_some() {
-        "The workspace is bound to the selected project root and drives the simulated runtime contract that will later be backed by the VM."
-    } else {
-        snapshot
-            .error
-            .as_deref()
-            .unwrap_or("Select or create a project to inspect the runtime.")
-    };
-    let root = build_root(title, subtitle);
+    let root = build_root(title, "Live VM and guest status");
+    refresh_runtime_async();
+    let weak_root = root.downgrade();
+    gtk::glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
+        if weak_root.upgrade().is_none() {
+            return gtk::glib::ControlFlow::Break;
+        }
+        refresh_runtime_async();
+        gtk::glib::ControlFlow::Continue
+    });
+    let title_for_updates = root
+        .first_child()
+        .and_downcast::<Label>()
+        .map(|label| label.downgrade());
     let error_label = workspace_error_label();
     root.append(&error_label);
 
@@ -1131,6 +1170,15 @@ extern "C" fn create_overview_view(
             let Some(error_label) = error_label_for_updates.upgrade() else {
                 return;
             };
+            if let Some(title) = title_for_updates.as_ref().and_then(|label| label.upgrade()) {
+                title.set_label(
+                    snapshot
+                        .project
+                        .as_ref()
+                        .map(|p| p.file.name.as_str())
+                        .unwrap_or("Loading project…"),
+                );
+            }
             populate_overview_from_snapshot(&list, &error_label, snapshot);
         }))
     });

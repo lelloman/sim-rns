@@ -1,4 +1,4 @@
-use gtk::prelude::ApplicationExtManual;
+use gtk::prelude::{ApplicationExt, ApplicationExtManual};
 use maruzzella::{
     build_application_with_handle, default_product_spec, load_static_plugin, plugin_tab,
     LauncherSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, ShellChrome, ShellMode,
@@ -89,24 +89,17 @@ fn main() {
 
     let config = MaruzzellaConfig::new("com.lelloman.sim-rns")
         .with_persistence_id("sim-rns")
-        .with_startup_mode(if restored_project.is_some() {
-            ShellMode::Workspace
-        } else {
-            ShellMode::Launcher
-        })
+        .with_startup_mode(ShellMode::Launcher)
         .with_launcher(launcher)
         .with_workspace_chrome(ShellChrome {
             show_menu_bar: true,
             show_toolbar: true,
             show_search: false,
+            ..ShellChrome::workspace_default()
         })
         .with_launcher_window_policy(WindowPolicy::new(980, 720))
         .with_product(product)
         .with_builtin_plugin(embedded_sim_rns_plugin);
-
-    if let Some(project_handle) = restored_project.clone() {
-        set_active_project_handle(Some(project_handle));
-    }
 
     let workspace_product = config.product.clone();
     let (app, handle) = build_application_with_handle(config);
@@ -137,6 +130,16 @@ fn main() {
             set_active_project_handle(None);
         }
         result
+    });
+    // Restore through the same session transition as opening from the launcher.
+    // Starting directly in Workspace would give the shell an empty project handle.
+    let restored_project = std::cell::RefCell::new(restored_project);
+    app.connect_activate(move |_| {
+        if let Some(project) = restored_project.borrow_mut().take() {
+            if let Err(error) = sim_rns_core::open_project(project) {
+                eprintln!("sim-rns: failed to restore project session: {error}");
+            }
+        }
     });
     app.run();
 }
@@ -253,6 +256,8 @@ fn toolbar_item(
         secondary: false,
         display_mode: ToolbarDisplayMode::IconOnly,
         appearance_id: appearance_id.to_string(),
+        options: Vec::new(),
+        selected_index: 0,
     }
 }
 
@@ -308,7 +313,7 @@ fn save_project_session(handle: &ProjectHandle) -> Result<(), String> {
     };
     let payload = serde_json::to_vec_pretty(&session)
         .map_err(|error| format!("failed to serialize app session: {error}"))?;
-    std::fs::write(&path, payload)
+    sim_rns_core::persistence::atomic_write(&path, &payload)
         .map_err(|error| format!("failed to write {}: {error}", path.display()))
 }
 

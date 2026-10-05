@@ -1,10 +1,14 @@
+use persistence::{atomic_write, project_lock};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+mod guest;
+pub mod persistence;
+mod qmp;
 pub mod runtime;
 pub use runtime::{
     FileBackedRuntime, NodeRuntimeState, ProjectRuntime, QemuRuntime, RuntimeBackendState,
@@ -104,18 +108,13 @@ pub enum AssetMode {
     Template,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RestartPolicy {
     Never,
+    #[default]
     OnFailure,
     Always,
-}
-
-impl Default for RestartPolicy {
-    fn default() -> Self {
-        Self::OnFailure
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -278,7 +277,7 @@ type ProjectCloseCallback = dyn Fn() -> Result<(), String> + 'static;
 thread_local! {
     static PROJECT_OPENER: RefCell<Option<Box<ProjectOpenCallback>>> = RefCell::new(None);
     static PROJECT_CLOSER: RefCell<Option<Box<ProjectCloseCallback>>> = RefCell::new(None);
-    static ACTIVE_PROJECT_HANDLE: RefCell<Option<ProjectHandle>> = RefCell::new(None);
+    static ACTIVE_PROJECT_HANDLE: RefCell<Option<ProjectHandle>> = const { RefCell::new(None) };
 }
 
 pub fn install_project_opener<F>(opener: F)
@@ -454,7 +453,7 @@ pub fn create_project(root_path: impl AsRef<Path>, name: &str) -> Result<Project
     let file_path = project_file_path(&root_path);
     let payload = serde_json::to_string_pretty(&file)
         .map_err(|error| format!("failed to serialize project file: {error}"))?;
-    std::fs::write(&file_path, payload)
+    atomic_write(&file_path, payload.as_bytes())
         .map_err(|error| format!("failed to write {}: {error}", file_path.display()))?;
 
     Ok(Project { root_path, file })
@@ -464,7 +463,7 @@ fn write_project_file(project: &Project) -> Result<(), String> {
     let file_path = project_file_path(&project.root_path);
     let payload = serde_json::to_string_pretty(&project.file)
         .map_err(|error| format!("failed to serialize project file: {error}"))?;
-    std::fs::write(&file_path, payload)
+    atomic_write(&file_path, payload.as_bytes())
         .map_err(|error| format!("failed to write {}: {error}", file_path.display()))
 }
 
@@ -534,12 +533,12 @@ fn write_project_scaffold_files(root_path: &Path, project_id: &str) -> Result<()
 fn write_pretty_json<T: Serialize>(path: PathBuf, value: &T) -> Result<(), String> {
     let payload = serde_json::to_string_pretty(value)
         .map_err(|error| format!("failed to serialize {}: {error}", path.display()))?;
-    std::fs::write(&path, payload)
+    atomic_write(&path, payload.as_bytes())
         .map_err(|error| format!("failed to write {}: {error}", path.display()))
 }
 
 fn write_file(path: PathBuf, contents: &str) -> Result<(), String> {
-    std::fs::write(&path, contents)
+    atomic_write(&path, contents.as_bytes())
         .map_err(|error| format!("failed to write {}: {error}", path.display()))
 }
 
@@ -599,7 +598,14 @@ fn resolve_project_relative_path(root_path: &Path, relative_path: &str) -> Resul
             resolved.display()
         ));
     }
-    Ok(resolved)
+    let canonical = std::fs::canonicalize(&resolved).map_err(|e| e.to_string())?;
+    let root = std::fs::canonicalize(root_path).map_err(|e| e.to_string())?;
+    if !canonical.starts_with(root) || !canonical.is_file() {
+        return Err(format!(
+            "{relative_path} must resolve to a file inside the project"
+        ));
+    }
+    Ok(canonical)
 }
 
 fn load_node_file(root_path: &Path, relative_path: &str) -> Result<ProjectNodeFile, String> {
@@ -660,6 +666,15 @@ fn build_script_element(root_path: &Path, relative_path: &str) -> Result<Element
 }
 
 pub fn project_recipe(project: &Project) -> Result<Recipe, String> {
+    for path in project
+        .file
+        .includes
+        .configs
+        .iter()
+        .chain(&project.file.includes.assets)
+    {
+        resolve_project_relative_path(&project.root_path, path)?;
+    }
     let mut elements = Vec::new();
     let mut attachments = Vec::new();
 
@@ -697,7 +712,7 @@ pub fn project_recipe(project: &Project) -> Result<Recipe, String> {
         project.file.startup.clone()
     };
 
-    Ok(Recipe {
+    let recipe = Recipe {
         metadata: RecipeMetadata {
             id: project.file.project_id.clone(),
             name: project.file.name.clone(),
@@ -708,7 +723,117 @@ pub fn project_recipe(project: &Project) -> Result<Recipe, String> {
         elements,
         topology: Topology { attachments },
         startup,
-    })
+    };
+    validate_recipe(&recipe)?;
+    for element in &recipe.elements {
+        for asset in &element.assets {
+            resolve_project_relative_path(&project.root_path, &asset.source)?;
+            validate_relative_destination(&asset.destination)?;
+        }
+    }
+    Ok(recipe)
+}
+
+fn validate_relative_destination(value: &str) -> Result<(), String> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || path.is_absolute()
+        || value.contains('\0')
+        || path
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(format!("invalid asset destination {value:?}"));
+    }
+    Ok(())
+}
+
+pub fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
+    fn identifier(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 64
+            && value != "."
+            && value != ".."
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    }
+    if !identifier(&recipe.metadata.id) || recipe.metadata.name.trim().is_empty() {
+        return Err("project needs a valid ID and a nonempty name".into());
+    }
+    if recipe.vm.ram_mb == 0 || recipe.vm.cpu_cores == 0 || recipe.vm.base_image.trim().is_empty() {
+        return Err("VM requires a base image, positive RAM, and at least one CPU".into());
+    }
+    let templates: BTreeMap<_, _> = recipe
+        .templates
+        .iter()
+        .map(|t| (t.id.as_str(), t))
+        .collect();
+    if templates.len() != recipe.templates.len() {
+        return Err("duplicate template IDs".into());
+    }
+    let mut elements = BTreeMap::new();
+    for element in &recipe.elements {
+        if !identifier(&element.id) || elements.insert(element.id.as_str(), element).is_some() {
+            return Err(format!("invalid or duplicate element ID: {}", element.id));
+        }
+        let template = templates.get(element.template_id.as_str()).ok_or_else(|| {
+            format!(
+                "unknown template {} for {}",
+                element.template_id, element.id
+            )
+        })?;
+        let limits = element
+            .resources
+            .as_ref()
+            .unwrap_or(&template.defaults.resources);
+        if limits.cpu_weight > 10000 {
+            return Err(format!("{} has a CPU weight above 10000", element.id));
+        }
+        let command = element
+            .command_override
+            .as_ref()
+            .unwrap_or(&template.defaults.command);
+        if command.is_empty()
+            || command[0].trim().is_empty()
+            || command.iter().any(|arg| arg.contains('\0'))
+        {
+            return Err(format!("{} has an invalid command", element.id));
+        }
+        if element
+            .env
+            .iter()
+            .any(|(key, value)| key.is_empty() || key.contains(['=', '\0']) || value.contains('\0'))
+        {
+            return Err(format!(
+                "{} has an invalid environment variable",
+                element.id
+            ));
+        }
+    }
+    let mut startup = BTreeSet::new();
+    for id in &recipe.startup.order {
+        if !elements.contains_key(id.as_str()) || !startup.insert(id) {
+            return Err(format!("unknown or duplicate startup element {id}"));
+        }
+    }
+    let mut links = BTreeSet::new();
+    for link in &recipe.topology.attachments {
+        let network = elements
+            .get(link.network_id.as_str())
+            .ok_or_else(|| format!("unknown network {}", link.network_id))?;
+        if !elements.contains_key(link.element_id.as_str())
+            || link.element_id == link.network_id
+            || templates[network.template_id.as_str()].category != TemplateCategory::Network
+            || !links.insert(link)
+        {
+            return Err(format!(
+                "invalid topology attachment {} -> {}",
+                link.element_id, link.network_id
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn unique_project_entry_path(
@@ -716,12 +841,13 @@ fn unique_project_entry_path(
     dir_name: &str,
     stem: &str,
     suffix: &str,
+    used_ids: &BTreeSet<String>,
 ) -> (String, PathBuf) {
     for index in 1.. {
         let file_name = format!("{stem}-{index}{suffix}");
         let relative = format!("{dir_name}/{file_name}");
         let absolute = root_path.join(&relative);
-        if !absolute.exists() {
+        if !absolute.exists() && !used_ids.contains(&format!("{stem}-{index}")) {
             return (relative, absolute);
         }
     }
@@ -729,9 +855,21 @@ fn unique_project_entry_path(
 }
 
 pub fn add_script_include(project_root: impl AsRef<Path>) -> Result<(Project, String), String> {
-    let mut project = load_project(project_root)?;
-    let (relative_path, absolute_path) =
-        unique_project_entry_path(&project.root_path, PROJECT_SCRIPTS_DIR, "script", ".py");
+    let root = normalize_local_project_path(project_root.as_ref())?;
+    let _lock = project_lock(&root)?;
+    let mut project = load_project(&root)?;
+    let used_ids = project_recipe(&project)?
+        .elements
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    let (relative_path, absolute_path) = unique_project_entry_path(
+        &project.root_path,
+        PROJECT_SCRIPTS_DIR,
+        "script",
+        ".py",
+        &used_ids,
+    );
     let script_id = Path::new(&relative_path)
         .file_stem()
         .and_then(|value| value.to_str())
@@ -744,12 +882,13 @@ pub fn add_script_include(project_root: impl AsRef<Path>) -> Result<(Project, St
         &format!("print(\"Sim RNS script stub: {script_id}\")\n"),
     )?;
     project.file.includes.scripts.push(relative_path.clone());
-    if !project
-        .file
-        .startup
-        .order
-        .iter()
-        .any(|entry| entry == &script_id)
+    if !project.file.startup.order.is_empty()
+        && !project
+            .file
+            .startup
+            .order
+            .iter()
+            .any(|entry| entry == &script_id)
     {
         project.file.startup.order.push(script_id);
     }
@@ -759,9 +898,21 @@ pub fn add_script_include(project_root: impl AsRef<Path>) -> Result<(Project, St
 }
 
 pub fn add_node_include(project_root: impl AsRef<Path>) -> Result<(Project, String), String> {
-    let mut project = load_project(project_root)?;
-    let (relative_path, absolute_path) =
-        unique_project_entry_path(&project.root_path, PROJECT_NODES_DIR, "node", ".node.json");
+    let root = normalize_local_project_path(project_root.as_ref())?;
+    let _lock = project_lock(&root)?;
+    let mut project = load_project(&root)?;
+    let used_ids = project_recipe(&project)?
+        .elements
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    let (relative_path, absolute_path) = unique_project_entry_path(
+        &project.root_path,
+        PROJECT_NODES_DIR,
+        "node",
+        ".node.json",
+        &used_ids,
+    );
     let node_id = Path::new(&relative_path)
         .file_stem()
         .and_then(|value| value.to_str())
@@ -784,16 +935,22 @@ pub fn add_node_include(project_root: impl AsRef<Path>) -> Result<(Project, Stri
                 cpu_weight: 100,
             }),
             command_override: None,
-            attachments: vec!["lan-main".to_string()],
+            attachments: project_recipe(&project)?
+                .elements
+                .iter()
+                .find(|e| e.enabled && e.template_id == "network.lan")
+                .map(|e| vec![e.id.clone()])
+                .unwrap_or_default(),
         },
     )?;
     project.file.includes.nodes.push(relative_path.clone());
-    if !project
-        .file
-        .startup
-        .order
-        .iter()
-        .any(|entry| entry == &node_id)
+    if !project.file.startup.order.is_empty()
+        && !project
+            .file
+            .startup
+            .order
+            .iter()
+            .any(|entry| entry == &node_id)
     {
         project.file.startup.order.push(node_id);
     }
