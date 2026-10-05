@@ -378,6 +378,19 @@ impl ProjectRuntime for QemuRuntime {
     }
 }
 
+/// Caller holds the project lock, so another controller cannot boot during an edit.
+pub(crate) fn require_stopped_for_edit(project: &Project) -> Result<(), String> {
+    let recipe = project_recipe(project)?;
+    let state = load_or_init_state(project, &recipe).map_err(|e| e.to_string())?;
+    let status = QemuRuntime::default()
+        .observe_status(project, &state, &recipe)
+        .map_err(|e| e.to_string())?;
+    if status.vm_state != RuntimeVmState::Stopped {
+        return Err("stop the VM before editing project sources".into());
+    }
+    Ok(())
+}
+
 impl QemuRuntime {
     fn observe_status(
         &self,

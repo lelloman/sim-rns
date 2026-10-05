@@ -1,3 +1,4 @@
+mod control;
 use gtk::prelude::{ApplicationExt, ApplicationExtManual};
 use maruzzella::{
     build_application_with_handle, default_product_spec, load_static_plugin, plugin_tab,
@@ -37,6 +38,21 @@ fn main() {
     product.include_base_toolbar_items = false;
     product.menu_roots = root_menu_roots();
     product.menu_items = root_menu_items();
+    // Register every menu command explicitly so the shell installs a discoverable
+    // window action even when the menu item ID differs from its command ID.
+    for item in &product.menu_items {
+        if !item.command_id.is_empty()
+            && !product
+                .commands
+                .iter()
+                .any(|command| command.id == item.command_id)
+        {
+            product.commands.push(maruzzella::spec::CommandSpec {
+                id: item.command_id.clone(),
+                title: item.label.clone(),
+            });
+        }
+    }
     product.toolbar_items = runtime_toolbar_items();
 
     product.layout.workbench = WorkbenchNodeSpec::Group(TabGroupSpec::new(
@@ -105,6 +121,9 @@ fn main() {
     let (app, handle) = build_application_with_handle(config);
     let launcher_handle = handle.clone();
     install_project_closer(move || {
+        if sim_rns_plugin::runtime_command_is_busy() {
+            return Err("wait for the current operation to finish".into());
+        }
         set_active_project_handle(None);
         clear_saved_project_session();
         launcher_handle
@@ -112,6 +131,9 @@ fn main() {
             .map_err(|error| error.to_string())
     });
     install_project_opener(move |project_handle| {
+        if sim_rns_plugin::runtime_command_is_busy() {
+            return Err("wait for the current operation to finish".into());
+        }
         set_active_project_handle(Some(project_handle.clone()));
         let project_handle_bytes = project_handle.to_bytes()?;
         let result = handle
@@ -141,6 +163,7 @@ fn main() {
             }
         }
     });
+    control::install(&app);
     app.run();
 }
 

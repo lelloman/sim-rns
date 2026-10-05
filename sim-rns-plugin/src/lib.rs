@@ -246,16 +246,31 @@ fn current_runtime_vm_state() -> Option<RuntimeVmState> {
     RUNTIME_CONTROLLER.with(|controller| controller.vm_state())
 }
 
-fn runtime_command_is_busy() -> bool {
+pub fn runtime_command_is_busy() -> bool {
     RUNTIME_CONTROLLER.with(|controller| controller.is_busy())
 }
 
-fn refresh_runtime_store() {
+pub fn refresh_runtime_store() {
     RUNTIME_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
     RUNTIME_CONTROLLER.with(|controller| {
         controller.refresh(RuntimeViewSnapshot::empty);
     });
     refresh_runtime_async();
+}
+
+/// Reserve the same operation slot used by toolbar actions. Call on the GTK thread.
+pub fn begin_external_operation() -> Result<(), String> {
+    if runtime_command_is_busy() {
+        return Err("a runtime operation is already in progress".into());
+    }
+    RUNTIME_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
+    RUNTIME_CONTROLLER.with(|controller| controller.begin_operation(RuntimeOperation::Controlling));
+    Ok(())
+}
+
+/// Release the external operation slot and refresh the displayed runtime state.
+pub fn finish_external_operation() {
+    refresh_runtime_store();
 }
 
 fn refresh_runtime_async() {

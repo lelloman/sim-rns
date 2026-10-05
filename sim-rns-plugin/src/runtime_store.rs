@@ -187,6 +187,7 @@ pub(crate) struct RuntimeViewSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RuntimeOperation {
+    Controlling,
     Starting,
     Pausing,
     Stopping,

@@ -10,7 +10,7 @@ The workspace currently uses a sibling `../maruzzella` checkout (tested with 0.1
 cargo build --workspace --locked
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo fmt -p sim-rns-app -p sim-rns-core -p sim-rns-plugin -- --check
+cargo fmt -p sim-rns-app -p sim-rns-core -p sim-rns-plugin -p sim-rns-control -p sim-rns-mcp -- --check
 ```
 
 Tests use local Unix sockets. The explicit QEMU lifecycle test needs QEMU but no OS image:
@@ -18,6 +18,22 @@ Tests use local Unix sockets. The explicit QEMU lifecycle test needs QEMU but no
 ```sh
 cargo test -p sim-rns-core real_qemu_lifecycle -- --ignored --nocapture
 ```
+
+## MCP control
+
+The `sim-rns-mcp` binary provides a stdio MCP server for the running GTK app. Its tools can launch the app, manage projects and source files, control the VM and individual nodes, inspect logs, operate the UI, and capture window screenshots. See [MCP setup and tool reference](docs/mcp.md) for client configuration, examples, limitations, and integration tests.
+
+```json
+{
+  "mcpServers": {
+    "sim-rns": {
+      "command": "/absolute/path/to/sim-rns/target/debug/sim-rns-mcp"
+    }
+  }
+}
+```
+
+Build the workspace first. From the MCP client, call `launch` to open the app (or attach to an existing instance), then use `app` with `{"operation":"state"}` and `ui` with `{"operation":"tree"}`. The client must run in the same desktop session as the app.
 
 ## Build a guest bundle
 

@@ -373,6 +373,88 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<Project, String> {
     Ok(project)
 }
 
+/// Read a bounded UTF-8 source file, excluding private runtime and VCS metadata.
+pub fn read_project_source(root: &Path, relative: &str) -> Result<String, String> {
+    let path = project_source_path(root, relative)?;
+    std::fs::read_to_string(path).map_err(|e| e.to_string())
+}
+
+fn project_source_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let path = resolve_project_relative_path(root, relative)?;
+    let canonical_root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+    if path
+        .strip_prefix(canonical_root)
+        .map_err(|e| e.to_string())?
+        .components()
+        .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
+    {
+        return Err("private project metadata is not a source file".into());
+    }
+    if std::fs::metadata(&path).map_err(|e| e.to_string())?.len() > 1024 * 1024 {
+        return Err("project source files must be at most 1 MiB".into());
+    }
+    Ok(path)
+}
+
+/// Atomically replace an existing text source, restoring it if recipe validation fails.
+pub fn write_project_source(
+    root: &Path,
+    relative: &str,
+    contents: &str,
+) -> Result<Project, String> {
+    if contents.len() > 1024 * 1024 {
+        return Err("project source files must be at most 1 MiB".into());
+    }
+    let _lock = project_lock(root)?;
+    runtime::require_stopped_for_edit(&load_project(root)?)?;
+    let path = project_source_path(root, relative)?;
+    let original = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    atomic_write(&path, contents.as_bytes())?;
+    match load_project(root) {
+        Ok(project) => Ok(project),
+        Err(error) => {
+            atomic_write(&path, original.as_bytes())
+                .map_err(|restore| format!("{error}; rollback failed: {restore}"))?;
+            Err(format!("edit rejected and original restored: {error}"))
+        }
+    }
+}
+
+/// Create a runnable Python Reticulum demo from a built guest bundle.
+pub fn create_demo_project(
+    path: impl AsRef<Path>,
+    bundle: impl AsRef<Path>,
+) -> Result<Project, String> {
+    let image = std::fs::canonicalize(bundle.as_ref()).map_err(|e| e.to_string())?;
+    let mut project = create_project(path, "Reticulum Guest Demo")?;
+    project.file.vm.base_image = image.to_string_lossy().into_owned();
+    project.file.vm.ram_mb = 512;
+    project.file.vm.cpu_cores = 1;
+    for filename in ["backbone-a.node.json", "phone-a.node.json"] {
+        let path = project.root_path.join("nodes").join(filename);
+        let mut node: ProjectNodeFile =
+            serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        node.template_id = "reticulum.python.backbone".into();
+        for asset in &mut node.assets {
+            asset.mode = AssetMode::Copy;
+        }
+        node.resources = Some(ResourceLimits {
+            memory_mb: 256,
+            cpu_weight: 100,
+        });
+        persistence::atomic_write(
+            &path,
+            &serde_json::to_vec_pretty(&node).map_err(|e| e.to_string())?,
+        )?;
+    }
+    persistence::atomic_write(
+        &project_file_path(&project.root_path),
+        &serde_json::to_vec_pretty(&project.file).map_err(|e| e.to_string())?,
+    )?;
+    load_project(&project.root_path)
+}
+
 pub fn create_project(root_path: impl AsRef<Path>, name: &str) -> Result<Project, String> {
     let requested_root = root_path.as_ref();
     let trimmed_name = name.trim();

@@ -17,6 +17,47 @@ fn project(label: &str) -> Project {
 }
 
 #[test]
+fn source_edits_validate_rollback_and_confine_paths() {
+    let p = project("source-edit");
+    let original = read_project_source(&p.root_path, PROJECT_FILE_NAME).unwrap();
+    assert!(
+        write_project_source(&p.root_path, PROJECT_FILE_NAME, "invalid")
+            .unwrap_err()
+            .contains("restored")
+    );
+    assert_eq!(
+        read_project_source(&p.root_path, PROJECT_FILE_NAME).unwrap(),
+        original
+    );
+    let mut changed = p.file.clone();
+    changed.name = "Edited".into();
+    assert_eq!(
+        write_project_source(
+            &p.root_path,
+            PROJECT_FILE_NAME,
+            &serde_json::to_string(&changed).unwrap()
+        )
+        .unwrap()
+        .file
+        .name,
+        "Edited"
+    );
+    for path in ["../outside", "/etc/passwd", ".sim-rns/runtime-state.json"] {
+        assert!(read_project_source(&p.root_path, path).is_err());
+        assert!(write_project_source(&p.root_path, path, "no").is_err());
+    }
+    std::os::unix::fs::symlink("/etc/passwd", p.root_path.join("escape.txt")).unwrap();
+    assert!(read_project_source(&p.root_path, "escape.txt").is_err());
+    std::os::unix::fs::symlink(
+        ".sim-rns/runtime-state.json",
+        p.root_path.join("private.txt"),
+    )
+    .unwrap();
+    assert!(read_project_source(&p.root_path, "private.txt").is_err());
+    std::fs::remove_dir_all(p.root_path).unwrap();
+}
+
+#[test]
 fn parallel_commands_are_serialized_without_lost_updates() {
     let p = project("parallel");
     let barrier = Arc::new(Barrier::new(8));

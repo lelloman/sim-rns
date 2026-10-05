@@ -16,34 +16,7 @@ fn run() -> Result<(), String> {
         let image = args
             .get(2)
             .ok_or("create-demo requires a guest image bundle")?;
-        let image = std::fs::canonicalize(image).map_err(|e| e.to_string())?;
-        let mut project = create_project(&args[1], "Reticulum Guest Demo")?;
-        project.file.vm.base_image = image.to_string_lossy().into_owned();
-        project.file.vm.ram_mb = 512;
-        project.file.vm.cpu_cores = 1;
-        for filename in ["backbone-a.node.json", "phone-a.node.json"] {
-            let path = project.root_path.join("nodes").join(filename);
-            let mut node: ProjectNodeFile =
-                serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-            node.template_id = "reticulum.python.backbone".into();
-            for asset in &mut node.assets {
-                asset.mode = AssetMode::Copy;
-            }
-            node.resources = Some(ResourceLimits {
-                memory_mb: 256,
-                cpu_weight: 100,
-            });
-            persistence::atomic_write(
-                &path,
-                &serde_json::to_vec_pretty(&node).map_err(|e| e.to_string())?,
-            )?;
-        }
-        persistence::atomic_write(
-            &project_file_path(&project.root_path),
-            &serde_json::to_vec_pretty(&project.file).map_err(|e| e.to_string())?,
-        )?;
-        load_project(&project.root_path)?;
+        let project = create_demo_project(&args[1], image)?;
         println!("{}", project.root_path.display());
         return Ok(());
     }
